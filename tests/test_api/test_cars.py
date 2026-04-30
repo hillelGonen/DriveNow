@@ -48,12 +48,12 @@ def client() -> TestClient:
 
 
 def test_create_and_list_car(client: TestClient) -> None:
-    payload = {"model": "Tesla Model 3", "year": 2024}
+    payload = {"model": "Tesla Model Y", "year": 2024}
     create_resp = client.post("/api/v1/cars", json=payload)
     assert create_resp.status_code == 201, create_resp.text
 
     body = create_resp.json()
-    assert body["model"] == "Tesla Model 3"
+    assert body["model"] == "Tesla Model Y"
     assert body["year"] == 2024
     assert body["status"] == "AVAILABLE"
     assert isinstance(body["id"], int)
