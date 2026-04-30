@@ -1,7 +1,8 @@
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from app.models.car import Car, CarStatus
+from app.models.rental import Rental
 from app.schemas.car import CarCreate, CarUpdate
 
 
@@ -37,3 +38,15 @@ def update(db: Session, car: Car, data: CarUpdate) -> Car:
     db.commit()
     db.refresh(car)
     return car
+
+
+def delete(db: Session, car: Car) -> None:
+    db.delete(car)
+    db.commit()
+
+
+def has_active_rental(db: Session, car_id: int) -> bool:
+    stmt = select(
+        exists().where(Rental.car_id == car_id, Rental.end_time.is_(None))
+    )
+    return bool(db.scalar(stmt))
