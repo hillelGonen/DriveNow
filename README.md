@@ -108,17 +108,39 @@ curl -s -X PATCH http://localhost:8000/api/v1/cars/1 \
 
 Only the fields you send are updated. Unknown `id` returns `404 {"detail": "Car not found"}`.
 
-### Start a rental
-
-A rental requires an existing user. There is no User CRUD endpoint yet — seed
-one directly:
+### Delete a car
 
 ```bash
-docker compose exec db psql -U drivenow -d drivenow \
-  -c "INSERT INTO users (name) VALUES ('Ada Lovelace') RETURNING id;"
+curl -s -X DELETE http://localhost:8000/api/v1/cars/1
 ```
 
-Then:
+`204 No Content` on success. Returns `404` if the car doesn't exist, `409
+{"detail": "Car 1 has an active rental"}` if a rental is in progress —
+the guard prevents orphaning rental rows whose `car_id` would otherwise
+cascade-delete.
+
+### Create a user
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/users/ \
+  -H 'content-type: application/json' \
+  -d '{"name": "Ada Lovelace"}'
+```
+
+```json
+{
+  "id": 1,
+  "name": "Ada Lovelace",
+  "created_at": "2026-04-30T08:00:00.000000Z",
+  "updated_at": "2026-04-30T08:00:00.000000Z"
+}
+```
+
+`GET /api/v1/users/`, `GET /api/v1/users/{id}`, and `DELETE /api/v1/users/{id}`
+mirror the car endpoints. Delete refuses (`409`) if the user has an active
+rental — same guard pattern as car delete, preserves rental history.
+
+### Start a rental
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/rentals/ \
@@ -282,10 +304,10 @@ PostgreSQL.
 ```
 app/
 ├── api/
-│   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py
-├── crud/               # SQLAlchemy data access: crud_car.py, crud_rental.py
+│   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py, users.py
+├── crud/               # SQLAlchemy data access: crud_car.py, crud_rental.py, crud_user.py
 ├── models/             # SQLAlchemy ORM (User, Car, Rental, TimestampMixin)
-├── schemas/            # Pydantic DTOs (car.py, rental.py)
+├── schemas/            # Pydantic DTOs (car.py, rental.py, user.py)
 ├── services/           # reserved — see Layers table
 ├── repositories/       # reserved — see services/
 ├── events/             # reserved publisher stub for future broker
@@ -295,20 +317,18 @@ alembic/                # schema migrations
   ├── 0001              # cars + rentals + carstatus enum
   └── 0002              # rental engine (users, user_id FK, time columns)
 tests/
-└── test_api/           # car + rental smoke tests, shared conftest
+├── conftest.py         # shared fixtures (engine, db_session, api_client, seed_user)
+├── test_api/           # endpoint smoke tests
+└── test_crud/          # direct CRUD layer unit tests
 docs/                   # additional architecture docs (placeholder)
 logs/                   # host-mounted log dir (.gitkeep tracked)
 ```
 
 ## Out of scope (next iterations)
 
-- User CRUD endpoints (currently users are seeded directly via psql).
-- Car `DELETE` endpoint (with "cannot delete car with active rental"
-  guard).
 - Custom Prometheus gauges (`drivenow_active_cars`,
   `drivenow_ongoing_rentals`) so the dashboard answers "how many cars
   are out right now?" without scraping the full operation histogram.
-- One more unit test (assignment minimum is ≥ 4; currently 3).
 - DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
 - Real message broker — `app/events/publisher.py` is still a no-op.
 - Promote the `app/services/` layer; align the `app/crud/` vs
