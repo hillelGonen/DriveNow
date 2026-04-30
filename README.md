@@ -33,11 +33,11 @@ Outer layers depend on inner ones, never the reverse.
 |-------|------|----------------|
 | **API** | `app/api/v1/endpoints/` | HTTP routing, request validation via `app/schemas/`, dependency injection of the DB session. No business rules. |
 | **Schemas** | `app/schemas/` | Pydantic DTOs. The only types that cross the API boundary — ORM objects never leave the CRUD layer. |
-| **CRUD** | `app/crud/` | SQLAlchemy data access (create / get / list / update). Currently the data + light-business layer; rentals will likely promote a separate service layer. |
+| **CRUD** | `app/crud/` | SQLAlchemy data access. Cars: pure CRUD. Rentals: also owns the `start_rental` / `return_car` transactions (row lock + status flip + idempotent return), which would normally live in a service layer. |
 | **Models** | `app/models/` | SQLAlchemy ORM definitions. UTC-aware timestamps via `TimestampMixin`. |
 | **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics. |
 | **Events** | `app/events/` | Reserved for message-broker integration. Stub publisher today, broker-aware tomorrow. |
-| **Services / Repositories** | `app/services/`, `app/repositories/` | Empty packages reserved for the next iteration when rentals introduce business rules and locking. |
+| **Services / Repositories** | `app/services/`, `app/repositories/` | Empty packages reserved for when business logic outgrows the CRUD layer (e.g., a third entity, multi-step workflows, or external integrations). |
 
 ## Quickstart
 
@@ -108,6 +108,61 @@ curl -s -X PATCH http://localhost:8000/api/v1/cars/1 \
 
 Only the fields you send are updated. Unknown `id` returns `404 {"detail": "Car not found"}`.
 
+### Start a rental
+
+A rental requires an existing user. There is no User CRUD endpoint yet — seed
+one directly:
+
+```bash
+docker compose exec db psql -U drivenow -d drivenow \
+  -c "INSERT INTO users (name) VALUES ('Ada Lovelace') RETURNING id;"
+```
+
+Then:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/rentals/ \
+  -H 'content-type: application/json' \
+  -d '{"user_id": 1, "car_id": 1}'
+```
+
+```json
+{
+  "id": 1,
+  "user_id": 1,
+  "car_id": 1,
+  "start_time": "2026-04-30T04:03:20.802051Z",
+  "end_time": null
+}
+```
+
+The car's status flips to `IN_USE` atomically. Renting a car that is not
+`AVAILABLE` returns `400 {"detail": "Car 1 is not available (status=IN_USE)"}`.
+The CRUD layer takes a `SELECT … FOR UPDATE` row lock on the car so concurrent
+booking attempts of the same car serialize at the DB.
+
+### Return a rental
+
+```bash
+curl -s -X PATCH http://localhost:8000/api/v1/rentals/1/return
+```
+
+```json
+{
+  "id": 1,
+  "user_id": 1,
+  "car_id": 1,
+  "start_time": "2026-04-30T04:03:20.802051Z",
+  "end_time": "2026-04-30T04:03:20.901813Z"
+}
+```
+
+`end_time` is set to `datetime.now(timezone.utc)`, the car flips back to
+`AVAILABLE`. The endpoint is **idempotent in the sense that double returns
+are rejected**: a second call returns `400 {"detail": "Rental 1 was already
+returned at …"}` instead of silently mutating `end_time` twice. Unknown `id`
+returns `404`.
+
 ## Metrics
 
 Two complementary instrumentation paths feed `/metrics`:
@@ -132,13 +187,20 @@ Recorded labels: `operation` (the name you pass), `status` (`success` /
 `error`). The decorator works on both sync and async callables and
 preserves the wrapped signature, so it's safe on FastAPI route handlers.
 
-Confirmed live after car CRUD usage:
+Confirmed live after exercising both CRUD APIs:
 
 ```
-drivenow_service_operation_total{operation="car.create",status="success"} 1.0
-drivenow_service_operation_total{operation="car.list",  status="success"} 2.0
-drivenow_service_operation_total{operation="car.update",status="success"} 1.0
+drivenow_service_operation_total{operation="car.create",   status="success"} 1.0
+drivenow_service_operation_total{operation="car.list",     status="success"} 2.0
+drivenow_service_operation_total{operation="car.update",   status="success"} 1.0
+drivenow_service_operation_total{operation="rental.start", status="success"} 1.0
+drivenow_service_operation_total{operation="rental.start", status="error"}   1.0
+drivenow_service_operation_total{operation="rental.return",status="success"} 1.0
+drivenow_service_operation_total{operation="rental.return",status="error"}   1.0
 ```
+
+The `error` rows correspond to the rejected double-rental and double-return —
+proof the decorator captures failure paths, not just happy ones.
 
 ## Migrations
 
@@ -154,27 +216,28 @@ docker compose exec api alembic upgrade head
 docker compose exec api alembic downgrade -1
 ```
 
-Initial migration ([alembic/versions/0001_initial_schema.py](alembic/versions/0001_initial_schema.py))
-creates `cars`, `rentals`, and the `carstatus` enum.
+- [alembic/versions/0001_initial_schema.py](alembic/versions/0001_initial_schema.py) — `cars`, `rentals`, `carstatus` enum.
+- [alembic/versions/0002_rental_engine.py](alembic/versions/0002_rental_engine.py) — adds `users`, restructures `rentals` (`user_id` FK, renames `start_date`/`end_date` → `start_time`/`end_time`, makes `end_time` nullable, drops `customer_name`). Downgrade backfills before tightening NOT-NULL constraints so it round-trips on populated tables.
 
 ## Tests
 
 ```bash
-docker compose exec api pytest tests/test_api/test_cars.py -v
+docker compose exec api pytest tests/ -v
 ```
 
-The smoke test ([tests/test_api/test_cars.py](tests/test_api/test_cars.py))
-uses an **in-memory SQLite** engine with `StaticPool` so the test is fast
-and self-contained (no Postgres required for unit-style tests). It
-overrides FastAPI's `get_db` dependency and asserts:
+Three tests today:
 
-- `POST /api/v1/cars` → 201 with the expected body.
-- `GET /api/v1/cars` → returns the created car.
-- `GET /api/v1/cars?status=MAINTENANCE` → returns `[]`.
+| File | Test | What it proves |
+|---|---|---|
+| [tests/test_api/test_cars.py](tests/test_api/test_cars.py) | `test_create_and_list_car` | POST creates a car (default `AVAILABLE`), GET lists it, status filter works. |
+| [tests/test_api/test_rentals.py](tests/test_api/test_rentals.py) | `test_double_rental_returns_400` | First booking succeeds and flips the car to `IN_USE`; the second returns 400. |
+| [tests/test_api/test_rentals.py](tests/test_api/test_rentals.py) | `test_return_rental_sets_end_time_and_frees_car` | Return sets `end_time`, flips the car back to `AVAILABLE`; second return is rejected. |
+
+Shared fixtures live in [tests/test_api/conftest.py](tests/test_api/conftest.py): a per-test in-memory SQLite engine with `StaticPool`, a `db_session`, an `api_client` that overrides FastAPI's `get_db`, and a `seed_user` fixture so the rental tests run zero-touch (no manual psql).
 
 > Gotcha worth knowing: `sqlite:///:memory:` without `StaticPool` gives
 > each new SQLAlchemy session its own empty in-memory database. Sharing
-> a single connection via `StaticPool` is what makes the test see the
+> a single connection via `StaticPool` is what makes the tests see the
 > tables created in the fixture.
 
 ## Development conventions
@@ -207,42 +270,48 @@ PostgreSQL.
   timezone — important for a rental product where bookings cross
   timezones and a "server local time" assumption silently corrupts data
   at booking boundaries.
-- The next iteration prevents overlapping rentals on the same car using
-  Postgres's `tstzrange` + `EXCLUDE USING gist (... WITH &&)` constraint
-  (requires the `btree_gist` extension shipped in `postgres-contrib`).
-  This DB-level guarantee is impossible in a typical document store and
-  hard to do correctly at the application level under concurrency.
+- Today's concurrency guarantee for "no double-booking the same car" is a
+  `SELECT … FOR UPDATE` row lock on the car inside `start_rental`. A future
+  iteration can harden this with a Postgres `tstzrange` + `EXCLUDE USING
+  gist (... WITH &&)` constraint (requires the `btree_gist` extension
+  shipped in `postgres-contrib`) so overlapping rental windows are
+  rejected at the DB level, not just at the application level.
 
 ## Layout
 
 ```
 app/
 ├── api/
-│   └── v1/endpoints/   # FastAPI routers — currently: cars.py
-├── crud/               # SQLAlchemy data access — currently: crud_car.py
-├── models/             # SQLAlchemy ORM (Car, Rental, TimestampMixin)
-├── schemas/            # Pydantic DTOs (car.py)
-├── services/           # reserved — promoted in next iteration for rentals
+│   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py
+├── crud/               # SQLAlchemy data access: crud_car.py, crud_rental.py
+├── models/             # SQLAlchemy ORM (User, Car, Rental, TimestampMixin)
+├── schemas/            # Pydantic DTOs (car.py, rental.py)
+├── services/           # reserved — see Layers table
 ├── repositories/       # reserved — see services/
 ├── events/             # reserved publisher stub for future broker
 ├── core/               # config, database, logging, metrics
 └── main.py             # FastAPI app entrypoint
-alembic/                # schema migrations (0001 = cars, rentals, carstatus enum)
+alembic/                # schema migrations
+  ├── 0001              # cars + rentals + carstatus enum
+  └── 0002              # rental engine (users, user_id FK, time columns)
 tests/
-└── test_api/           # smoke test for car CRUD
+└── test_api/           # car + rental smoke tests, shared conftest
 docs/                   # additional architecture docs (placeholder)
 logs/                   # host-mounted log dir (.gitkeep tracked)
 ```
 
 ## Out of scope (next iterations)
 
-- Rentals endpoints (book, end, list, status transitions, overlap
-  prevention via `EXCLUDE USING gist`).
+- User CRUD endpoints (currently users are seeded directly via psql).
 - Car `DELETE` endpoint (with "cannot delete car with active rental"
   guard).
-- Promote the `app/services/` layer for rental business rules; align
-  the `app/crud/` vs `app/repositories/` naming.
-- More tests (assignment requires ≥ 4 unit tests; currently 1 smoke
-  test).
+- Custom Prometheus gauges (`drivenow_active_cars`,
+  `drivenow_ongoing_rentals`) so the dashboard answers "how many cars
+  are out right now?" without scraping the full operation histogram.
+- One more unit test (assignment minimum is ≥ 4; currently 3).
+- DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
+- Real message broker — `app/events/publisher.py` is still a no-op.
+- Promote the `app/services/` layer; align the `app/crud/` vs
+  `app/repositories/` naming.
 - Real message broker — `app/events/publisher.py` is a no-op today.
 - Auth, rate limiting.
