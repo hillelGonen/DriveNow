@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -47,3 +47,21 @@ def update_car(car_id: int, payload: CarUpdate, db: Session = Depends(get_db)) -
         payload.model_dump(exclude_unset=True),
     )
     return CarRead.model_validate(updated)
+
+
+@router.delete("/{car_id}", status_code=status.HTTP_204_NO_CONTENT)
+@track_operation("car.delete")
+def delete_car(car_id: int, db: Session = Depends(get_db)) -> Response:
+    car = crud_car.get(db, car_id)
+    if car is None:
+        logger.warning("car.delete.not_found id=%s", car_id)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Car not found")
+    if crud_car.has_active_rental(db, car_id):
+        logger.warning("car.delete.has_active_rental id=%s", car_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Car {car_id} has an active rental",
+        )
+    crud_car.delete(db, car)
+    logger.info("car.deleted id=%s", car_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
