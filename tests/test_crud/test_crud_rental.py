@@ -5,6 +5,7 @@ Covers the business invariants that live in the CRUD layer today:
 - start_rental rejects an already-busy car
 - return_car is idempotent (second call raises)
 """
+
 from __future__ import annotations
 
 import pytest
@@ -48,9 +49,7 @@ def test_start_rental_rejects_unavailable_car(
         )
 
 
-def test_return_car_is_idempotent(
-    db_session: Session, seed_user: User, car
-) -> None:
+def test_return_car_is_idempotent(db_session: Session, seed_user: User, car) -> None:
     rental = crud_rental.start_rental(
         db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
     )

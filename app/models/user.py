@@ -10,4 +10,6 @@ class User(Base, TimestampMixin):
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)
 
-    rentals = relationship("Rental", back_populates="user", cascade="all, delete-orphan")
+    rentals = relationship(
+        "Rental", back_populates="user", cascade="all, delete-orphan"
+    )

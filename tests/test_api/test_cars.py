@@ -4,6 +4,7 @@ Uses an in-memory SQLite database so the test is fast and self-contained
 (no Docker / Postgres required). The production stack still uses Postgres
 via Alembic; this test exercises the API + crud + ORM contract only.
 """
+
 from __future__ import annotations
 
 import pytest

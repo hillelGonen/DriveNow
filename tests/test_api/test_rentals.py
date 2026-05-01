@@ -4,6 +4,7 @@ Asserts the core invariant: a car can be rented at most once concurrently.
 The second POST against the same car returns 400 Bad Request because the
 car's status is now IN_USE.
 """
+
 from __future__ import annotations
 
 from fastapi.testclient import TestClient

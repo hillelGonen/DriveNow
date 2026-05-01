@@ -6,6 +6,7 @@ session lifecycle: the API uses the overridden `get_db`, while the test
 also gets a direct `db_session` to seed reference rows (e.g. a User the
 rental test needs to exist before it POSTs).
 """
+
 from __future__ import annotations
 
 from typing import Iterator

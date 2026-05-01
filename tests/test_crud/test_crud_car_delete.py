@@ -1,4 +1,5 @@
 """Direct unit tests for car delete + has_active_rental guard."""
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
