@@ -324,11 +324,16 @@ docs/                   # additional architecture docs (placeholder)
 logs/                   # host-mounted log dir (.gitkeep tracked)
 ```
 
+## Development & Quality Assurance
+
+To ensure code quality, security, and consistent formatting, an audit script is provided:
+
+```bash
+./scripts/audit.sh
+```
+
 ## Out of scope (next iterations)
 
-- Custom Prometheus gauges (`drivenow_active_cars`,
-  `drivenow_ongoing_rentals`) so the dashboard answers "how many cars
-  are out right now?" without scraping the full operation histogram.
 - DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
 - Real message broker — `app/events/publisher.py` is still a no-op.
 - Promote the `app/services/` layer; align the `app/crud/` vs

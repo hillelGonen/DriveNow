@@ -46,7 +46,5 @@ def delete(db: Session, car: Car) -> None:
 
 
 def has_active_rental(db: Session, car_id: int) -> bool:
-    stmt = select(
-        exists().where(Rental.car_id == car_id, Rental.end_time.is_(None))
-    )
+    stmt = select(exists().where(Rental.car_id == car_id, Rental.end_time.is_(None)))
     return bool(db.scalar(stmt))

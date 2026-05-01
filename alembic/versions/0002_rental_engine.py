@@ -5,6 +5,7 @@ Revises: 0001
 Create Date: 2026-04-30 00:00:00.000000
 
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -40,10 +41,13 @@ def upgrade() -> None:
     # Restructure rentals: drop customer_name, rename date columns,
     # make end_time nullable, add user_id FK.
     op.drop_column("rentals", "customer_name")
-    op.alter_column("rentals", "start_date", new_column_name="start_time",
-                    server_default=sa.func.now())
-    op.alter_column("rentals", "end_date", new_column_name="end_time",
-                    nullable=True)
+    op.alter_column(
+        "rentals",
+        "start_date",
+        new_column_name="start_time",
+        server_default=sa.func.now(),
+    )
+    op.alter_column("rentals", "end_date", new_column_name="end_time", nullable=True)
     op.add_column(
         "rentals",
         sa.Column(
@@ -64,10 +68,10 @@ def downgrade() -> None:
     # Backfill before tightening the constraint, otherwise populated tables
     # blow up on the ALTER.
     op.execute("UPDATE rentals SET end_time = now() WHERE end_time IS NULL")
-    op.alter_column("rentals", "end_time", new_column_name="end_date",
-                    nullable=False)
-    op.alter_column("rentals", "start_time", new_column_name="start_date",
-                    server_default=None)
+    op.alter_column("rentals", "end_time", new_column_name="end_date", nullable=False)
+    op.alter_column(
+        "rentals", "start_time", new_column_name="start_date", server_default=None
+    )
 
     # Same pattern for customer_name: add nullable + backfill, then NOT NULL.
     # Adding a NOT NULL column with no default to a populated table fails

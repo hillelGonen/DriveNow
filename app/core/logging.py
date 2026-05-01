@@ -43,4 +43,5 @@ def setup_logging() -> None:
 
 def _gmt_converter(*args):
     import time
+
     return time.gmtime(*args)

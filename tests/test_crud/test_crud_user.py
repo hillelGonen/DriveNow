@@ -1,4 +1,5 @@
 """Direct unit tests for app.crud.crud_user."""
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session

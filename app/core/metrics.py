@@ -4,6 +4,8 @@ from functools import wraps
 
 from prometheus_client import Counter, Histogram
 
+from prometheus_client.core import GaugeMetricFamily, REGISTRY
+
 SERVICE_OPERATION_DURATION = Histogram(
     "drivenow_service_operation_duration_seconds",
     "Duration of service-layer business operations",
@@ -63,3 +65,34 @@ def track_operation(name: str):
         return sync_wrapper
 
     return decorator
+
+
+class FleetCollector:
+    def collect(self):
+        # Preventing Circular import
+        from app.core.database import SessionLocal
+        from app.models.car import Car, CarStatus
+        from app.models.rental import Rental
+
+        # Open local session for every scan
+        db = SessionLocal()
+        try:
+            # metrics 1: available cars
+            available_count = (
+                db.query(Car).filter(Car.status == CarStatus.AVAILABLE).count()
+            )
+            yield GaugeMetricFamily(
+                "drivenow_available_cars",
+                "Current count of cars with AVAILABLE status",
+                value=available_count,
+            )
+
+            # metrics 2: Active Rentals
+            active_rentals = db.query(Rental).filter(Rental.end_time == None).count()
+            yield GaugeMetricFamily(
+                "drivenow_active_rentals",
+                "Current count of ongoing rentals",
+                value=active_rentals,
+            )
+        finally:
+            db.close()

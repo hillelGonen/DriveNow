@@ -35,11 +35,15 @@ def list_cars(
 
 @router.patch("/{car_id}", response_model=CarRead)
 @track_operation("car.update")
-def update_car(car_id: int, payload: CarUpdate, db: Session = Depends(get_db)) -> CarRead:
+def update_car(
+    car_id: int, payload: CarUpdate, db: Session = Depends(get_db)
+) -> CarRead:
     car = crud_car.get(db, car_id)
     if car is None:
         logger.warning("car.update.not_found id=%s", car_id)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Car not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Car not found"
+        )
     updated = crud_car.update(db, car, payload)
     logger.info(
         "car.updated id=%s changes=%s",
@@ -55,7 +59,9 @@ def delete_car(car_id: int, db: Session = Depends(get_db)) -> Response:
     car = crud_car.get(db, car_id)
     if car is None:
         logger.warning("car.delete.not_found id=%s", car_id)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Car not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Car not found"
+        )
     if crud_car.has_active_rental(db, car_id):
         logger.warning("car.delete.has_active_rental id=%s", car_id)
         raise HTTPException(

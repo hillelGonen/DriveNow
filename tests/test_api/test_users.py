@@ -1,4 +1,5 @@
 """User CRUD endpoint tests."""
+
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
@@ -40,7 +41,9 @@ def test_delete_user_then_get_returns_404(api_client: TestClient) -> None:
 
 
 def test_delete_user_with_active_rental_returns_409(api_client: TestClient) -> None:
-    user_id = api_client.post("/api/v1/users/", json={"name": "Renting User"}).json()["id"]
+    user_id = api_client.post("/api/v1/users/", json={"name": "Renting User"}).json()[
+        "id"
+    ]
     car_id = api_client.post(
         "/api/v1/cars", json={"model": "Tesla Model Y", "year": 2024}
     ).json()["id"]
