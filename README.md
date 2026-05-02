@@ -22,7 +22,7 @@ flowchart LR
     Service -->|domain ops| Repo
     Repo -->|SQLAlchemy| DB
     Service -.->|publish events| Events
-    Events -.->|future| MQ
+    Events -.->|XADD| Redis[[Redis Streams<br/>drivenow_events]]
     API -. instrumentator .-> Prom
     API -. track_operation .-> Prom
 ```
@@ -38,7 +38,7 @@ Outer layers depend on inner ones, never the reverse.
 | **Services** | `app/services/` | Business logic and transaction boundary. `RentalService` owns the `start_rental` / `return_rental` flow: SELECT FOR UPDATE car lock, status validation, idempotent return, `db.commit()`, post-commit event publish. |
 | **Repositories** | `app/repositories/` | Thin data access. `db.add` / `db.flush` / `db.query`. No commits, no business validation. Car and User repositories also expose CRUD helpers used directly by their endpoints (single-table, no orchestration). |
 | **Models** | `app/models/` | SQLAlchemy ORM definitions. UTC-aware timestamps via `TimestampMixin`. |
-| **Events** | `app/events/` | Domain event publisher. Today: structured INFO logs on the `drivenow.events` logger. Tomorrow: drop-in AMQP/Redis backend; call sites stay identical. |
+| **Events** | `app/events/` | Domain event publisher. Structured INFO logs on `drivenow.events` logger + XADD to Redis Stream `drivenow_events`. Fire-and-forget — Redis failures are isolated; the service transaction is never affected. |
 | **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics + `FleetCollector` gauges. |
 
 ## Quickstart
@@ -355,6 +355,4 @@ To ensure code quality, security, and consistent formatting, an audit script is 
 ## Out of scope (next iterations)
 
 - DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
-- Real message broker (RabbitMQ / Redis Streams) — publisher interface
-  is in place; only the body of `publish()` needs to change.
 - Auth, rate limiting.
