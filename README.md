@@ -1,5 +1,9 @@
 # DriveNow
 
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-v0.110-green.svg)
+![Redis](https://img.shields.io/badge/Redis-Streams-red.svg)
+
 Vehicle Management System for a Car Rental Company.
 FastAPI + PostgreSQL + SQLAlchemy, containerized with Docker Compose,
 instrumented with Prometheus.
@@ -351,6 +355,18 @@ To ensure code quality, security, and consistent formatting, an audit script is 
   exposes `drivenow_available_cars` and `drivenow_active_rentals` as
   scrape-time gauges, queried directly from the DB on each `/metrics`
   poll (single source of truth, no drift).
+
+### API Interface & Event Streaming
+
+Our system follows a strict contract and ensures data consistency across services through events.
+
+| Component | Description | Screenshot |
+| :--- | :--- | :--- |
+| **Interactive Docs** | Fully typed Swagger/OpenAPI documentation. | ![Swagger](docs/screenshots/swagger_ui.png) |
+| **Event Stream** | Redis Streams capturing real-time rental events. | ![Redis](docs/screenshots/redis_events.png) |
+
+![Full System Demo](docs/screenshots/system_demo.jpg)
+
 
 ## Out of scope (next iterations)
 
