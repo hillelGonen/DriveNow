@@ -10,16 +10,18 @@ instrumented with Prometheus.
 flowchart LR
     Client([Client])
     API[API Layer<br/>app/api/v1/endpoints/]
-    CRUD[CRUD Layer<br/>app/crud/<br/>@track_operation]
+    Service[Service Layer<br/>app/services/<br/>RentalService]
+    Repo[Repository Layer<br/>app/repositories/]
     DB[(PostgreSQL)]
-    Events[Event Publisher<br/>app/events/ — reserved]
+    Events[Event Publisher<br/>app/events/]
     MQ[[Message Queue<br/>future]]
     Prom[/Prometheus<br/>/metrics/]
 
     Client -->|HTTP| API
-    API -->|Pydantic DTO| CRUD
-    CRUD -->|SQLAlchemy| DB
-    API -.->|publish events| Events
+    API -->|Pydantic DTO| Service
+    Service -->|domain ops| Repo
+    Repo -->|SQLAlchemy| DB
+    Service -.->|publish events| Events
     Events -.->|future| MQ
     API -. instrumentator .-> Prom
     API -. track_operation .-> Prom
@@ -31,13 +33,13 @@ Outer layers depend on inner ones, never the reverse.
 
 | Layer | Path | Responsibility |
 |-------|------|----------------|
-| **API** | `app/api/v1/endpoints/` | HTTP routing, request validation via `app/schemas/`, dependency injection of the DB session. No business rules. |
-| **Schemas** | `app/schemas/` | Pydantic DTOs. The only types that cross the API boundary — ORM objects never leave the CRUD layer. |
-| **CRUD** | `app/crud/` | SQLAlchemy data access. Cars: pure CRUD. Rentals: also owns the `start_rental` / `return_car` transactions (row lock + status flip + idempotent return), which would normally live in a service layer. |
+| **API** | `app/api/v1/endpoints/` | HTTP routing, request validation via `app/schemas/`, dependency injection of the DB session. Catches domain exceptions and maps them to HTTP status codes. No business rules. |
+| **Schemas** | `app/schemas/` | Pydantic DTOs. The only types that cross the API boundary — ORM objects never leave the repository/service layer. |
+| **Services** | `app/services/` | Business logic and transaction boundary. `RentalService` owns the `start_rental` / `return_rental` flow: SELECT FOR UPDATE car lock, status validation, idempotent return, `db.commit()`, post-commit event publish. |
+| **Repositories** | `app/repositories/` | Thin data access. `db.add` / `db.flush` / `db.query`. No commits, no business validation. Car and User repositories also expose CRUD helpers used directly by their endpoints (single-table, no orchestration). |
 | **Models** | `app/models/` | SQLAlchemy ORM definitions. UTC-aware timestamps via `TimestampMixin`. |
-| **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics. |
-| **Events** | `app/events/` | Reserved for message-broker integration. Stub publisher today, broker-aware tomorrow. |
-| **Services / Repositories** | `app/services/`, `app/repositories/` | Empty packages reserved for when business logic outgrows the CRUD layer (e.g., a third entity, multi-step workflows, or external integrations). |
+| **Events** | `app/events/` | Domain event publisher. Today: structured INFO logs on the `drivenow.events` logger. Tomorrow: drop-in AMQP/Redis backend; call sites stay identical. |
+| **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics + `FleetCollector` gauges. |
 
 ## Quickstart
 
@@ -305,13 +307,12 @@ PostgreSQL.
 app/
 ├── api/
 │   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py, users.py
-├── crud/               # SQLAlchemy data access: crud_car.py, crud_rental.py, crud_user.py
+├── services/           # business logic + transactions: rental_service.py
+├── repositories/       # thin SQLAlchemy data access: car_repo.py, rental_repo.py, user_repo.py
 ├── models/             # SQLAlchemy ORM (User, Car, Rental, TimestampMixin)
 ├── schemas/            # Pydantic DTOs (car.py, rental.py, user.py)
-├── services/           # reserved — see Layers table
-├── repositories/       # reserved — see services/
-├── events/             # reserved publisher stub for future broker
-├── core/               # config, database, logging, metrics
+├── events/             # domain event publisher (drivenow.events logger)
+├── core/               # config, database, logging, metrics + FleetCollector
 └── main.py             # FastAPI app entrypoint
 alembic/                # schema migrations
   ├── 0001              # cars + rentals + carstatus enum
@@ -319,7 +320,7 @@ alembic/                # schema migrations
 tests/
 ├── conftest.py         # shared fixtures (engine, db_session, api_client, seed_user)
 ├── test_api/           # endpoint smoke tests
-└── test_crud/          # direct CRUD layer unit tests
+└── test_crud/          # direct repository + service unit tests
 docs/                   # additional architecture docs (placeholder)
 logs/                   # host-mounted log dir (.gitkeep tracked)
 ```
@@ -332,11 +333,28 @@ To ensure code quality, security, and consistent formatting, an audit script is 
 ./scripts/audit.sh
 ```
 
+## Completed in Phase 4.5
+
+- **Service + Repository split.** Business logic, validation, transactions,
+  and event publishing live in `app/services/rental_service.py`
+  (`RentalService`). Repositories under `app/repositories/` are thin —
+  `db.add` / `db.flush` / `db.query` only, no commits. Endpoints depend on
+  the service, not on repository internals.
+- **Domain event publisher wired.** `publish()` in
+  `app/events/publisher.py` is no longer a no-op — it emits structured
+  INFO logs on the `drivenow.events` logger so consumers can subscribe
+  by logger name. `RentalService` calls it post-commit for
+  `rental.started` and `rental.ended` events. Swapping in a real broker
+  (RabbitMQ / Redis Streams) is a one-file change; call sites stay
+  identical.
+- **Custom Prometheus gauges.** `FleetCollector` in `app/core/metrics.py`
+  exposes `drivenow_available_cars` and `drivenow_active_rentals` as
+  scrape-time gauges, queried directly from the DB on each `/metrics`
+  poll (single source of truth, no drift).
+
 ## Out of scope (next iterations)
 
 - DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
-- Real message broker — `app/events/publisher.py` is still a no-op.
-- Promote the `app/services/` layer; align the `app/crud/` vs
-  `app/repositories/` naming.
-- Real message broker — `app/events/publisher.py` is a no-op today.
+- Real message broker (RabbitMQ / Redis Streams) — publisher interface
+  is in place; only the body of `publish()` needs to change.
 - Auth, rate limiting.
