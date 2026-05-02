@@ -1,9 +1,9 @@
-"""Direct unit tests for app.crud.crud_rental.
+"""Direct unit tests for the rental flow.
 
-Covers the business invariants that live in the CRUD layer today:
-- start_rental flips car to IN_USE
-- start_rental rejects an already-busy car
-- return_car is idempotent (second call raises)
+After the Phase 4.5 refactor, business invariants live on
+RentalService (app.services.rental_service). The repository layer
+(app.repositories.rental_repo) is pure data access and is not
+exercised here on its own.
 """
 
 from __future__ import annotations
@@ -11,24 +11,28 @@ from __future__ import annotations
 import pytest
 from sqlalchemy.orm import Session
 
-from app.crud import crud_car, crud_rental
-from app.crud.crud_rental import CarNotAvailableError, RentalAlreadyReturnedError
 from app.models.car import CarStatus
 from app.models.user import User
+from app.repositories import car_repo
+from app.repositories.rental_repo import (
+    CarNotAvailableError,
+    RentalAlreadyReturnedError,
+)
 from app.schemas.car import CarCreate
 from app.schemas.rental import RentalCreate
+from app.services.rental_service import RentalService
 
 
 @pytest.fixture()
 def car(db_session: Session):
-    return crud_car.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
+    return car_repo.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
 
 
 def test_start_rental_flips_car_to_in_use(
     db_session: Session, seed_user: User, car
 ) -> None:
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
+    rental = RentalService(db_session).start_rental(
+        RentalCreate(user_id=seed_user.id, car_id=car.id)
     )
     db_session.refresh(car)
 
@@ -40,19 +44,17 @@ def test_start_rental_flips_car_to_in_use(
 def test_start_rental_rejects_unavailable_car(
     db_session: Session, seed_user: User, car
 ) -> None:
-    crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-    )
+    service = RentalService(db_session)
+    service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
     with pytest.raises(CarNotAvailableError, match="not available"):
-        crud_rental.start_rental(
-            db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-        )
+        service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
 
 
-def test_return_car_is_idempotent(db_session: Session, seed_user: User, car) -> None:
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-    )
-    crud_rental.return_car(db_session, rental.id)
+def test_return_car_is_idempotent(
+    db_session: Session, seed_user: User, car
+) -> None:
+    service = RentalService(db_session)
+    rental = service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
+    service.return_rental(rental.id)
     with pytest.raises(RentalAlreadyReturnedError):
-        crud_rental.return_car(db_session, rental.id)
+        service.return_rental(rental.id)
