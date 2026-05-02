@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.metrics import track_operation
-from app.crud import crud_car
+from app.repositories import car_repo
 from app.models.car import CarStatus
 from app.schemas.car import CarCreate, CarRead, CarUpdate
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @router.post("", response_model=CarRead, status_code=status.HTTP_201_CREATED)
 @track_operation("car.create")
 def create_car(payload: CarCreate, db: Session = Depends(get_db)) -> CarRead:
-    car = crud_car.create(db, payload)
+    car = car_repo.create(db, payload)
     logger.info("car.created id=%s model=%s year=%s", car.id, car.model, car.year)
     return CarRead.model_validate(car)
 
@@ -29,7 +29,7 @@ def list_cars(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[CarRead]:
-    cars = crud_car.list_cars(db, status=status_filter, limit=limit, offset=offset)
+    cars = car_repo.list_cars(db, status=status_filter, limit=limit, offset=offset)
     return [CarRead.model_validate(c) for c in cars]
 
 
@@ -38,13 +38,13 @@ def list_cars(
 def update_car(
     car_id: int, payload: CarUpdate, db: Session = Depends(get_db)
 ) -> CarRead:
-    car = crud_car.get(db, car_id)
+    car = car_repo.get(db, car_id)
     if car is None:
         logger.warning("car.update.not_found id=%s", car_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Car not found"
         )
-    updated = crud_car.update(db, car, payload)
+    updated = car_repo.update(db, car, payload)
     logger.info(
         "car.updated id=%s changes=%s",
         updated.id,
@@ -56,18 +56,18 @@ def update_car(
 @router.delete("/{car_id}", status_code=status.HTTP_204_NO_CONTENT)
 @track_operation("car.delete")
 def delete_car(car_id: int, db: Session = Depends(get_db)) -> Response:
-    car = crud_car.get(db, car_id)
+    car = car_repo.get(db, car_id)
     if car is None:
         logger.warning("car.delete.not_found id=%s", car_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Car not found"
         )
-    if crud_car.has_active_rental(db, car_id):
+    if car_repo.has_active_rental(db, car_id):
         logger.warning("car.delete.has_active_rental id=%s", car_id)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Car {car_id} has an active rental",
         )
-    crud_car.delete(db, car)
+    car_repo.delete(db, car)
     logger.info("car.deleted id=%s", car_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

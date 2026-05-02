@@ -5,13 +5,13 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.metrics import track_operation
-from app.crud import crud_rental
-from app.crud.crud_rental import (
+from app.repositories.rental_repo import (
     CarNotAvailableError,
     RentalAlreadyReturnedError,
     RentalNotFoundError,
 )
 from app.schemas.rental import RentalCreate, RentalResponse
+from app.services.rental_service import RentalService
 
 router = APIRouter(prefix="/rentals", tags=["rentals"])
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def start_rental(
     payload: RentalCreate, db: Session = Depends(get_db)
 ) -> RentalResponse:
     try:
-        rental = crud_rental.start_rental(db, payload)
+        rental = RentalService(db).start_rental(payload)
     except CarNotAvailableError as exc:
         logger.warning("rental.start.rejected car_id=%s reason=%s", payload.car_id, exc)
         raise HTTPException(
@@ -43,7 +43,7 @@ def start_rental(
 @track_operation("rental.return")
 def return_rental(rental_id: int, db: Session = Depends(get_db)) -> RentalResponse:
     try:
-        rental = crud_rental.return_car(db, rental_id)
+        rental = RentalService(db).return_rental(rental_id)
     except RentalNotFoundError as exc:
         logger.warning("rental.return.not_found id=%s", rental_id)
         raise HTTPException(

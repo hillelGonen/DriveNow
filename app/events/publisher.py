@@ -1,14 +1,24 @@
+"""Domain event publisher.
+
+Today: structured INFO log on the `drivenow.events` logger so consumers
+(log aggregator, audit trail, ops dashboard) can subscribe by logger
+name. Tomorrow: swap this body for an AMQP/Redis publisher; the call
+sites in the service layer stay identical.
+
+Service-layer code calls publish() AFTER the transaction commits, so
+event consumers never see uncommitted state.
+"""
+
 import logging
+from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("drivenow.events")
 
 
-def publish(event: str, payload: dict) -> None:
-    """Reserved interface for the message broker. No-op until wired.
+def publish(event: str, payload: dict[str, Any]) -> None:
+    """Emit a domain event.
 
-    Service-layer code may call ``publish("rental.created", {...})`` today;
-    when a broker (RabbitMQ / Redis Streams) is added, only this module
-    changes. Keeping the call site stable lets domain events be authored
-    alongside business logic without waiting on infrastructure.
+    `event` is a dotted name (e.g. `rental.started`, `rental.ended`).
+    `payload` is a JSON-serializable dict with event-specific fields.
     """
-    logger.debug("event.publish.noop event=%s payload=%s", event, payload)
+    logger.info("event=%s payload=%s", event, payload)
