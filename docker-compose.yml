@@ -17,16 +17,24 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
   api:
     build: .
     user: "1000:1000"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql+psycopg2://drivenow:drivenow@db:5432/drivenow
       LOG_LEVEL: INFO
       LOG_FILE: /app/logs/app.log
+      REDIS_URL: redis://redis:6379/0
       TZ: UTC
     ports:
       - "8000:8000"

@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg2://drivenow:drivenow@db:5432/drivenow"
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "/app/logs/app.log"
+    REDIS_URL: str = "redis://redis:6379/0"
 
 
 @lru_cache

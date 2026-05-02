@@ -44,6 +44,7 @@ def setup_logging() -> None:
 
 def _gmt_converter(*args):
     import time
+
     return time.gmtime(*args)
 -e \n
 --- FILE: ./app/core/metrics.py ---
@@ -52,6 +53,8 @@ import time
 from functools import wraps
 
 from prometheus_client import Counter, Histogram
+
+from prometheus_client.core import GaugeMetricFamily, REGISTRY
 
 SERVICE_OPERATION_DURATION = Histogram(
     "drivenow_service_operation_duration_seconds",
@@ -112,6 +115,37 @@ def track_operation(name: str):
         return sync_wrapper
 
     return decorator
+
+
+class FleetCollector:
+    def collect(self):
+        # Preventing Circular import
+        from app.core.database import SessionLocal
+        from app.models.car import Car, CarStatus
+        from app.models.rental import Rental
+
+        # Open local session for every scan
+        db = SessionLocal()
+        try:
+            # metrics 1: available cars
+            available_count = (
+                db.query(Car).filter(Car.status == CarStatus.AVAILABLE).count()
+            )
+            yield GaugeMetricFamily(
+                "drivenow_available_cars",
+                "Current count of cars with AVAILABLE status",
+                value=available_count,
+            )
+
+            # metrics 2: Active Rentals
+            active_rentals = db.query(Rental).filter(Rental.end_time == None).count()
+            yield GaugeMetricFamily(
+                "drivenow_active_rentals",
+                "Current count of ongoing rentals",
+                value=active_rentals,
+            )
+        finally:
+            db.close()
 -e \n
 --- FILE: ./app/core/config.py ---
 from functools import lru_cache
@@ -174,7 +208,143 @@ def get_db() -> Generator[Session, None, None]:
 -e \n
 --- FILE: ./app/__init__.py ---
 -e \n
+--- FILE: ./app/repositories/rental_repo.py ---
+"""Thin data-access layer for rentals.
+
+Repository layer: focused strictly on database operations. No business
+logic, no transaction management (caller commits), no event publishing.
+"""
+
+from datetime import datetime, timezone
+
+from sqlalchemy.orm import Session
+
+from app.models.car import Car
+from app.models.rental import Rental
+from app.schemas.rental import RentalCreate
+
+
+class CarNotAvailableError(Exception):
+    """Raised when a rental cannot start because the car is not AVAILABLE."""
+
+
+class RentalNotFoundError(Exception):
+    """Raised when a rental id does not exist."""
+
+
+class RentalAlreadyReturnedError(Exception):
+    """Raised when return_car is called on a rental whose end_time is set."""
+
+
+def lock_car(db: Session, car_id: int) -> Car | None:
+    """SELECT ... FOR UPDATE on the car row. Caller commits."""
+    return db.query(Car).filter(Car.id == car_id).with_for_update().one_or_none()
+
+
+def insert_rental(db: Session, data: RentalCreate) -> Rental:
+    """Insert a rental row and flush so .id is populated. Caller commits."""
+    rental = Rental(user_id=data.user_id, car_id=data.car_id)
+    db.add(rental)
+    db.flush()
+    return rental
+
+
+def get(db: Session, rental_id: int) -> Rental | None:
+    return db.get(Rental, rental_id)
+
+
+def stamp_end_time(rental: Rental) -> None:
+    """Set rental.end_time to UTC now. Pure mutation, caller commits."""
+    rental.end_time = datetime.now(timezone.utc)
+-e \n
 --- FILE: ./app/repositories/__init__.py ---
+-e \n
+--- FILE: ./app/repositories/user_repo.py ---
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session
+
+from app.models.rental import Rental
+from app.models.user import User
+from app.schemas.user import UserCreate
+
+
+def create(db: Session, data: UserCreate) -> User:
+    user = User(name=data.name)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def get(db: Session, user_id: int) -> User | None:
+    return db.get(User, user_id)
+
+
+def list_users(db: Session, limit: int = 50, offset: int = 0) -> list[User]:
+    stmt = select(User).order_by(User.id).limit(limit).offset(offset)
+    return list(db.scalars(stmt))
+
+
+def delete(db: Session, user: User) -> None:
+    db.delete(user)
+    db.commit()
+
+
+def has_active_rental(db: Session, user_id: int) -> bool:
+    stmt = select(exists().where(Rental.user_id == user_id, Rental.end_time.is_(None)))
+    return bool(db.scalar(stmt))
+-e \n
+--- FILE: ./app/repositories/car_repo.py ---
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session
+
+from app.models.car import Car, CarStatus
+from app.models.rental import Rental
+from app.schemas.car import CarCreate, CarUpdate
+
+
+def create(db: Session, data: CarCreate) -> Car:
+    car = Car(model=data.model, year=data.year, status=data.status)
+    db.add(car)
+    db.commit()
+    db.refresh(car)
+    return car
+
+
+def get(db: Session, car_id: int) -> Car | None:
+    return db.get(Car, car_id)
+
+
+def list_cars(
+    db: Session,
+    status: CarStatus | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Car]:
+    stmt = select(Car).order_by(Car.id)
+    if status is not None:
+        stmt = stmt.where(Car.status == status)
+    stmt = stmt.limit(limit).offset(offset)
+    return list(db.scalars(stmt))
+
+
+def update(db: Session, car: Car, data: CarUpdate) -> Car:
+    payload = data.model_dump(exclude_unset=True)
+    for field, value in payload.items():
+        setattr(car, field, value)
+    db.commit()
+    db.refresh(car)
+    return car
+
+
+def delete(db: Session, car: Car) -> None:
+    db.delete(car)
+    db.commit()
+
+
+def has_active_rental(db: Session, car_id: int) -> bool:
+    stmt = select(exists().where(Rental.car_id == car_id, Rental.end_time.is_(None)))
+    return bool(db.scalar(stmt))
 -e \n
 --- FILE: ./app/models/user.py ---
 from sqlalchemy import Column, Integer, String
@@ -189,7 +359,9 @@ class User(Base, TimestampMixin):
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)
 
-    rentals = relationship("Rental", back_populates="user", cascade="all, delete-orphan")
+    rentals = relationship(
+        "Rental", back_populates="user", cascade="all, delete-orphan"
+    )
 -e \n
 --- FILE: ./app/models/rental.py ---
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, func
@@ -379,163 +551,6 @@ class CarRead(CarBase):
     created_at: datetime
     updated_at: datetime
 -e \n
---- FILE: ./app/crud/crud_car.py ---
-from sqlalchemy import exists, select
-from sqlalchemy.orm import Session
-
-from app.models.car import Car, CarStatus
-from app.models.rental import Rental
-from app.schemas.car import CarCreate, CarUpdate
-
-
-def create(db: Session, data: CarCreate) -> Car:
-    car = Car(model=data.model, year=data.year, status=data.status)
-    db.add(car)
-    db.commit()
-    db.refresh(car)
-    return car
-
-
-def get(db: Session, car_id: int) -> Car | None:
-    return db.get(Car, car_id)
-
-
-def list_cars(
-    db: Session,
-    status: CarStatus | None = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[Car]:
-    stmt = select(Car).order_by(Car.id)
-    if status is not None:
-        stmt = stmt.where(Car.status == status)
-    stmt = stmt.limit(limit).offset(offset)
-    return list(db.scalars(stmt))
-
-
-def update(db: Session, car: Car, data: CarUpdate) -> Car:
-    payload = data.model_dump(exclude_unset=True)
-    for field, value in payload.items():
-        setattr(car, field, value)
-    db.commit()
-    db.refresh(car)
-    return car
-
-
-def delete(db: Session, car: Car) -> None:
-    db.delete(car)
-    db.commit()
-
-
-def has_active_rental(db: Session, car_id: int) -> bool:
-    stmt = select(
-        exists().where(Rental.car_id == car_id, Rental.end_time.is_(None))
-    )
-    return bool(db.scalar(stmt))
--e \n
---- FILE: ./app/crud/__init__.py ---
--e \n
---- FILE: ./app/crud/crud_user.py ---
-from sqlalchemy import exists, select
-from sqlalchemy.orm import Session
-
-from app.models.rental import Rental
-from app.models.user import User
-from app.schemas.user import UserCreate
-
-
-def create(db: Session, data: UserCreate) -> User:
-    user = User(name=data.name)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-def get(db: Session, user_id: int) -> User | None:
-    return db.get(User, user_id)
-
-
-def list_users(db: Session, limit: int = 50, offset: int = 0) -> list[User]:
-    stmt = select(User).order_by(User.id).limit(limit).offset(offset)
-    return list(db.scalars(stmt))
-
-
-def delete(db: Session, user: User) -> None:
-    db.delete(user)
-    db.commit()
-
-
-def has_active_rental(db: Session, user_id: int) -> bool:
-    stmt = select(
-        exists().where(Rental.user_id == user_id, Rental.end_time.is_(None))
-    )
-    return bool(db.scalar(stmt))
--e \n
---- FILE: ./app/crud/crud_rental.py ---
-from datetime import datetime, timezone
-
-from sqlalchemy.orm import Session
-
-from app.models.car import Car, CarStatus
-from app.models.rental import Rental
-from app.schemas.rental import RentalCreate
-
-
-class CarNotAvailableError(Exception):
-    """Raised when a rental cannot start because the car is not AVAILABLE."""
-
-
-class RentalNotFoundError(Exception):
-    """Raised when a rental id does not exist."""
-
-
-class RentalAlreadyReturnedError(Exception):
-    """Raised when return_car is called on a rental whose end_time is set."""
-
-
-def start_rental(db: Session, data: RentalCreate) -> Rental:
-    """Atomically start a rental.
-
-    Locks the car row (SELECT ... FOR UPDATE) so concurrent bookings of
-    the same car serialize at the DB. Without the lock, two requests
-    could both pass the AVAILABLE check before either flips the status.
-    """
-    car = db.query(Car).filter(Car.id == data.car_id).with_for_update().one_or_none()
-    if car is None:
-        raise CarNotAvailableError(f"Car {data.car_id} does not exist")
-    if car.status != CarStatus.AVAILABLE:
-        raise CarNotAvailableError(
-            f"Car {car.id} is not available (status={car.status.value})"
-        )
-
-    rental = Rental(user_id=data.user_id, car_id=data.car_id)
-    car.status = CarStatus.IN_USE
-    db.add(rental)
-    db.commit()
-    db.refresh(rental)
-    return rental
-
-
-def return_car(db: Session, rental_id: int) -> Rental:
-    rental = db.get(Rental, rental_id)
-    if rental is None:
-        raise RentalNotFoundError(f"Rental {rental_id} not found")
-    if rental.end_time is not None:
-        raise RentalAlreadyReturnedError(
-            f"Rental {rental_id} was already returned at {rental.end_time.isoformat()}"
-        )
-
-    car = db.query(Car).filter(Car.id == rental.car_id).with_for_update().one()
-
-    # Explicit UTC-aware datetime to stay consistent with the column's
-    # server_default=func.now() (which Postgres returns as timestamptz).
-    rental.end_time = datetime.now(timezone.utc)
-    car.status = CarStatus.AVAILABLE
-    db.commit()
-    db.refresh(rental)
-    return rental
--e \n
 --- FILE: ./app/api/v1/__init__.py ---
 -e \n
 --- FILE: ./app/api/__init__.py ---
@@ -576,20 +591,30 @@ Consumers run as separate processes (`python -m app.events.consumers.rental_cons
 and ride the same `app/core/logging.py` + `app/core/metrics.py` infrastructure.
 -e \n
 --- FILE: ./app/events/publisher.py ---
+"""Domain event publisher.
+
+Today: structured INFO log on the `drivenow.events` logger so consumers
+(log aggregator, audit trail, ops dashboard) can subscribe by logger
+name. Tomorrow: swap this body for an AMQP/Redis publisher; the call
+sites in the service layer stay identical.
+
+Service-layer code calls publish() AFTER the transaction commits, so
+event consumers never see uncommitted state.
+"""
+
 import logging
+from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("drivenow.events")
 
 
-def publish(event: str, payload: dict) -> None:
-    """Reserved interface for the message broker. No-op until wired.
+def publish(event: str, payload: dict[str, Any]) -> None:
+    """Emit a domain event.
 
-    Service-layer code may call ``publish("rental.created", {...})`` today;
-    when a broker (RabbitMQ / Redis Streams) is added, only this module
-    changes. Keeping the call site stable lets domain events be authored
-    alongside business logic without waiting on infrastructure.
+    `event` is a dotted name (e.g. `rental.started`, `rental.ended`).
+    `payload` is a JSON-serializable dict with event-specific fields.
     """
-    logger.debug("event.publish.noop event=%s payload=%s", event, payload)
+    logger.info("event=%s payload=%s", event, payload)
 -e \n
 --- FILE: ./app/main.py ---
 import logging
@@ -597,11 +622,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import REGISTRY
 
 from app.api.v1.endpoints import cars as cars_router
 from app.api.v1.endpoints import rentals as rentals_router
 from app.api.v1.endpoints import users as users_router
 from app.core import metrics as _metrics  # noqa: F401 -- register service instruments
+from app.core.metrics import FleetCollector
 from app.core.config import get_settings
 from app.core.logging import setup_logging
 
@@ -621,6 +648,12 @@ app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
+try:
+    REGISTRY.register(FleetCollector())
+    logger.info("metrics.collector_registered")
+except ValueError:
+    logger.debug("metrics.collector_already_registered")
+
 app.include_router(cars_router.router, prefix="/api/v1")
 app.include_router(rentals_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")
@@ -629,6 +662,103 @@ app.include_router(users_router.router, prefix="/api/v1")
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+-e \n
+--- FILE: ./app/services/rental_service.py ---
+"""Rental service layer.
+
+Owns the transaction boundary, business rules (status validation,
+idempotency), and event emission for rentals. Delegates pure data
+access to app.repositories.rental_repo.
+"""
+
+import logging
+
+from sqlalchemy.orm import Session
+
+from app.events.publisher import publish
+from app.models.car import CarStatus
+from app.models.rental import Rental
+from app.repositories import rental_repo
+from app.repositories.rental_repo import (
+    CarNotAvailableError,
+    RentalAlreadyReturnedError,
+    RentalNotFoundError,
+)
+from app.schemas.rental import RentalCreate
+
+logger = logging.getLogger(__name__)
+
+
+class RentalService:
+    """Business logic for the rental lifecycle.
+
+    Sequence (start): lock car -> validate AVAILABLE -> insert rental ->
+    flip car to IN_USE -> commit -> publish event.
+
+    Sequence (return): load rental -> guard already-returned -> lock car
+    -> stamp end_time -> flip car to AVAILABLE -> commit -> publish event.
+
+    The car-row SELECT FOR UPDATE serializes concurrent bookings of the
+    same car at the database level, so the AVAILABLE check is race-free.
+    """
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def start_rental(self, data: RentalCreate) -> Rental:
+        car = rental_repo.lock_car(self.db, data.car_id)
+        if car is None:
+            raise CarNotAvailableError(f"Car {data.car_id} does not exist")
+        if car.status != CarStatus.AVAILABLE:
+            raise CarNotAvailableError(
+                f"Car {car.id} is not available (status={car.status.value})"
+            )
+
+        rental = rental_repo.insert_rental(self.db, data)
+        car.status = CarStatus.IN_USE
+
+        self.db.commit()
+        self.db.refresh(rental)
+
+        publish(
+            "rental.started",
+            {
+                "rental_id": rental.id,
+                "car_id": car.id,
+                "user_id": rental.user_id,
+                "start_time": rental.start_time.isoformat(),
+            },
+        )
+        return rental
+
+    def return_rental(self, rental_id: int) -> Rental:
+        rental = rental_repo.get(self.db, rental_id)
+        if rental is None:
+            raise RentalNotFoundError(f"Rental {rental_id} not found")
+        if rental.end_time is not None:
+            raise RentalAlreadyReturnedError(
+                f"Rental {rental_id} was already returned at "
+                f"{rental.end_time.isoformat()}"
+            )
+
+        car = rental_repo.lock_car(self.db, rental.car_id)
+        rental_repo.stamp_end_time(rental)
+        if car is not None:
+            car.status = CarStatus.AVAILABLE
+
+        self.db.commit()
+        self.db.refresh(rental)
+
+        publish(
+            "rental.ended",
+            {
+                "rental_id": rental.id,
+                "car_id": rental.car_id,
+                "user_id": rental.user_id,
+                "end_time": rental.end_time.isoformat(),
+            },
+        )
+        return rental
 -e \n
 --- FILE: ./app/services/__init__.py ---
 -e \n
@@ -645,7 +775,8 @@ prometheus-fastapi-instrumentator==7.0.0
 python-dotenv==1.0.1
 pytest==8.3.3
 httpx==0.27.2
--e \n
+bandit==1.7.10
+black==24.10.0-e \n
 --- FILE: ./alembic.ini ---
 [alembic]
 script_location = alembic
@@ -733,6 +864,7 @@ session lifecycle: the API uses the overridden `get_db`, while the test
 also gets a direct `db_session` to seed reference rows (e.g. a User the
 rental test needs to exist before it POSTs).
 """
+
 from __future__ import annotations
 
 from typing import Iterator
@@ -814,84 +946,92 @@ def seed_user(db_session: Session) -> User:
     return user
 -e \n
 --- FILE: ./tests/test_crud/test_crud_user.py ---
-"""Direct unit tests for app.crud.crud_user."""
+"""Direct unit tests for app.repositories.user_repo."""
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.crud import crud_car, crud_rental, crud_user
+from app.repositories import car_repo, user_repo
 from app.models.user import User
 from app.schemas.car import CarCreate
 from app.schemas.rental import RentalCreate
 from app.schemas.user import UserCreate
+from app.services.rental_service import RentalService
 
 
 def test_create_persists_user(db_session: Session) -> None:
-    user = crud_user.create(db_session, UserCreate(name="Ada"))
+    user = user_repo.create(db_session, UserCreate(name="Ada"))
     assert user.id is not None
     assert user.name == "Ada"
 
 
 def test_list_returns_inserted_users(db_session: Session) -> None:
-    crud_user.create(db_session, UserCreate(name="A"))
-    crud_user.create(db_session, UserCreate(name="B"))
-    users = crud_user.list_users(db_session)
+    user_repo.create(db_session, UserCreate(name="A"))
+    user_repo.create(db_session, UserCreate(name="B"))
+    users = user_repo.list_users(db_session)
     assert {u.name for u in users} == {"A", "B"}
 
 
 def test_has_active_rental_reflects_rental_state(
     db_session: Session, seed_user: User
 ) -> None:
-    car = crud_car.create(db_session, CarCreate(model="X", year=2024))
+    car = car_repo.create(db_session, CarCreate(model="X", year=2024))
 
-    assert crud_user.has_active_rental(db_session, seed_user.id) is False
+    assert user_repo.has_active_rental(db_session, seed_user.id) is False
 
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
+    service = RentalService(db_session)
+    rental = service.start_rental(
+        RentalCreate(user_id=seed_user.id, car_id=car.id)
     )
-    assert crud_user.has_active_rental(db_session, seed_user.id) is True
+    assert user_repo.has_active_rental(db_session, seed_user.id) is True
 
-    crud_rental.return_car(db_session, rental.id)
-    assert crud_user.has_active_rental(db_session, seed_user.id) is False
+    service.return_rental(rental.id)
+    assert user_repo.has_active_rental(db_session, seed_user.id) is False
 
 
 def test_delete_removes_user(db_session: Session) -> None:
-    user = crud_user.create(db_session, UserCreate(name="Disposable"))
+    user = user_repo.create(db_session, UserCreate(name="Disposable"))
     user_id = user.id
-    crud_user.delete(db_session, user)
-    assert crud_user.get(db_session, user_id) is None
+    user_repo.delete(db_session, user)
+    assert user_repo.get(db_session, user_id) is None
 -e \n
 --- FILE: ./tests/test_crud/test_crud_car.py ---
-"""Direct unit tests for app.crud.crud_car.
+"""Direct unit tests for app.repositories.car_repo.
 
-Hits the CRUD layer with a real Session (in-memory SQLite via the
+Hits the repository layer with a real Session (in-memory SQLite via the
 shared `db_session` fixture in tests/conftest.py). Bypasses FastAPI
 entirely so we exercise the data-access contract on its own.
 """
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.crud import crud_car
+from app.repositories import car_repo
 from app.models.car import CarStatus
 from app.schemas.car import CarCreate, CarUpdate
 
 
 def test_create_persists_with_default_status(db_session: Session) -> None:
-    car = crud_car.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
+    car = car_repo.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
     assert car.id is not None
     assert car.status == CarStatus.AVAILABLE
     assert car.model == "Tesla Model Y"
 
 
 def test_list_filters_by_status(db_session: Session) -> None:
-    crud_car.create(db_session, CarCreate(model="A", year=2020))
-    crud_car.create(db_session, CarCreate(model="B", year=2021, status=CarStatus.MAINTENANCE))
-    crud_car.create(db_session, CarCreate(model="C", year=2022, status=CarStatus.MAINTENANCE))
+    car_repo.create(db_session, CarCreate(model="A", year=2020))
+    car_repo.create(
+        db_session, CarCreate(model="B", year=2021, status=CarStatus.MAINTENANCE)
+    )
+    car_repo.create(
+        db_session, CarCreate(model="C", year=2022, status=CarStatus.MAINTENANCE)
+    )
 
-    available = crud_car.list_cars(db_session, status=CarStatus.AVAILABLE)
-    maintenance = crud_car.list_cars(db_session, status=CarStatus.MAINTENANCE)
-    everything = crud_car.list_cars(db_session)
+    available = car_repo.list_cars(db_session, status=CarStatus.AVAILABLE)
+    maintenance = car_repo.list_cars(db_session, status=CarStatus.MAINTENANCE)
+    everything = car_repo.list_cars(db_session)
 
     assert {c.model for c in available} == {"A"}
     assert {c.model for c in maintenance} == {"B", "C"}
@@ -899,81 +1039,89 @@ def test_list_filters_by_status(db_session: Session) -> None:
 
 
 def test_update_partial_only_touches_provided_fields(db_session: Session) -> None:
-    car = crud_car.create(db_session, CarCreate(model="Original", year=2020))
-    updated = crud_car.update(db_session, car, CarUpdate(status=CarStatus.IN_USE))
+    car = car_repo.create(db_session, CarCreate(model="Original", year=2020))
+    updated = car_repo.update(db_session, car, CarUpdate(status=CarStatus.IN_USE))
     assert updated.status == CarStatus.IN_USE
-    assert updated.model == "Original"  # untouched
-    assert updated.year == 2020         # untouched
+    assert updated.model == "Original"
+    assert updated.year == 2020
 -e \n
 --- FILE: ./tests/test_crud/__init__.py ---
 -e \n
 --- FILE: ./tests/test_crud/test_crud_car_delete.py ---
 """Direct unit tests for car delete + has_active_rental guard."""
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.crud import crud_car, crud_rental
+from app.repositories import car_repo
 from app.models.user import User
 from app.schemas.car import CarCreate
 from app.schemas.rental import RentalCreate
+from app.services.rental_service import RentalService
 
 
 def test_has_active_rental_false_for_unrented_car(db_session: Session) -> None:
-    car = crud_car.create(db_session, CarCreate(model="X", year=2024))
-    assert crud_car.has_active_rental(db_session, car.id) is False
+    car = car_repo.create(db_session, CarCreate(model="X", year=2024))
+    assert car_repo.has_active_rental(db_session, car.id) is False
 
 
 def test_has_active_rental_true_during_rental(
     db_session: Session, seed_user: User
 ) -> None:
-    car = crud_car.create(db_session, CarCreate(model="X", year=2024))
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
+    car = car_repo.create(db_session, CarCreate(model="X", year=2024))
+    service = RentalService(db_session)
+    rental = service.start_rental(
+        RentalCreate(user_id=seed_user.id, car_id=car.id)
     )
-    assert crud_car.has_active_rental(db_session, car.id) is True
+    assert car_repo.has_active_rental(db_session, car.id) is True
 
-    crud_rental.return_car(db_session, rental.id)
-    assert crud_car.has_active_rental(db_session, car.id) is False
+    service.return_rental(rental.id)
+    assert car_repo.has_active_rental(db_session, car.id) is False
 
 
 def test_delete_removes_car(db_session: Session) -> None:
-    car = crud_car.create(db_session, CarCreate(model="Disposable", year=2024))
+    car = car_repo.create(db_session, CarCreate(model="Disposable", year=2024))
     car_id = car.id
-    crud_car.delete(db_session, car)
-    assert crud_car.get(db_session, car_id) is None
+    car_repo.delete(db_session, car)
+    assert car_repo.get(db_session, car_id) is None
 -e \n
 --- FILE: ./tests/test_crud/test_crud_rental.py ---
-"""Direct unit tests for app.crud.crud_rental.
+"""Direct unit tests for the rental flow.
 
-Covers the business invariants that live in the CRUD layer today:
-- start_rental flips car to IN_USE
-- start_rental rejects an already-busy car
-- return_car is idempotent (second call raises)
+After the Phase 4.5 refactor, business invariants live on
+RentalService (app.services.rental_service). The repository layer
+(app.repositories.rental_repo) is pure data access and is not
+exercised here on its own.
 """
+
 from __future__ import annotations
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.crud import crud_car, crud_rental
-from app.crud.crud_rental import CarNotAvailableError, RentalAlreadyReturnedError
 from app.models.car import CarStatus
 from app.models.user import User
+from app.repositories import car_repo
+from app.repositories.rental_repo import (
+    CarNotAvailableError,
+    RentalAlreadyReturnedError,
+)
 from app.schemas.car import CarCreate
 from app.schemas.rental import RentalCreate
+from app.services.rental_service import RentalService
 
 
 @pytest.fixture()
 def car(db_session: Session):
-    return crud_car.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
+    return car_repo.create(db_session, CarCreate(model="Tesla Model Y", year=2024))
 
 
 def test_start_rental_flips_car_to_in_use(
     db_session: Session, seed_user: User, car
 ) -> None:
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
+    rental = RentalService(db_session).start_rental(
+        RentalCreate(user_id=seed_user.id, car_id=car.id)
     )
     db_session.refresh(car)
 
@@ -985,29 +1133,26 @@ def test_start_rental_flips_car_to_in_use(
 def test_start_rental_rejects_unavailable_car(
     db_session: Session, seed_user: User, car
 ) -> None:
-    crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-    )
+    service = RentalService(db_session)
+    service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
     with pytest.raises(CarNotAvailableError, match="not available"):
-        crud_rental.start_rental(
-            db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-        )
+        service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
 
 
 def test_return_car_is_idempotent(
     db_session: Session, seed_user: User, car
 ) -> None:
-    rental = crud_rental.start_rental(
-        db_session, RentalCreate(user_id=seed_user.id, car_id=car.id)
-    )
-    crud_rental.return_car(db_session, rental.id)
+    service = RentalService(db_session)
+    rental = service.start_rental(RentalCreate(user_id=seed_user.id, car_id=car.id))
+    service.return_rental(rental.id)
     with pytest.raises(RentalAlreadyReturnedError):
-        crud_rental.return_car(db_session, rental.id)
+        service.return_rental(rental.id)
 -e \n
 --- FILE: ./tests/__init__.py ---
 -e \n
 --- FILE: ./tests/test_api/test_cars_delete.py ---
 """DELETE /cars/{id} tests."""
+
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
@@ -1053,6 +1198,7 @@ Asserts the core invariant: a car can be rented at most once concurrently.
 The second POST against the same car returns 400 Bad Request because the
 car's status is now IN_USE.
 """
+
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
@@ -1112,6 +1258,7 @@ def test_return_rental_sets_end_time_and_frees_car(
 -e \n
 --- FILE: ./tests/test_api/test_users.py ---
 """User CRUD endpoint tests."""
+
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
@@ -1153,7 +1300,9 @@ def test_delete_user_then_get_returns_404(api_client: TestClient) -> None:
 
 
 def test_delete_user_with_active_rental_returns_409(api_client: TestClient) -> None:
-    user_id = api_client.post("/api/v1/users/", json={"name": "Renting User"}).json()["id"]
+    user_id = api_client.post("/api/v1/users/", json={"name": "Renting User"}).json()[
+        "id"
+    ]
     car_id = api_client.post(
         "/api/v1/cars", json={"model": "Tesla Model Y", "year": 2024}
     ).json()["id"]
@@ -1171,8 +1320,9 @@ def test_delete_user_with_active_rental_returns_409(api_client: TestClient) -> N
 
 Uses an in-memory SQLite database so the test is fast and self-contained
 (no Docker / Postgres required). The production stack still uses Postgres
-via Alembic; this test exercises the API + crud + ORM contract only.
+via Alembic; this test exercises the API + repositories + ORM contract only.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -1250,16 +1400,18 @@ instrumented with Prometheus.
 flowchart LR
     Client([Client])
     API[API Layer<br/>app/api/v1/endpoints/]
-    CRUD[CRUD Layer<br/>app/crud/<br/>@track_operation]
+    Service[Service Layer<br/>app/services/<br/>RentalService]
+    Repo[Repository Layer<br/>app/repositories/]
     DB[(PostgreSQL)]
-    Events[Event Publisher<br/>app/events/ — reserved]
+    Events[Event Publisher<br/>app/events/]
     MQ[[Message Queue<br/>future]]
     Prom[/Prometheus<br/>/metrics/]
 
     Client -->|HTTP| API
-    API -->|Pydantic DTO| CRUD
-    CRUD -->|SQLAlchemy| DB
-    API -.->|publish events| Events
+    API -->|Pydantic DTO| Service
+    Service -->|domain ops| Repo
+    Repo -->|SQLAlchemy| DB
+    Service -.->|publish events| Events
     Events -.->|future| MQ
     API -. instrumentator .-> Prom
     API -. track_operation .-> Prom
@@ -1271,13 +1423,13 @@ Outer layers depend on inner ones, never the reverse.
 
 | Layer | Path | Responsibility |
 |-------|------|----------------|
-| **API** | `app/api/v1/endpoints/` | HTTP routing, request validation via `app/schemas/`, dependency injection of the DB session. No business rules. |
-| **Schemas** | `app/schemas/` | Pydantic DTOs. The only types that cross the API boundary — ORM objects never leave the CRUD layer. |
-| **CRUD** | `app/crud/` | SQLAlchemy data access. Cars: pure CRUD. Rentals: also owns the `start_rental` / `return_car` transactions (row lock + status flip + idempotent return), which would normally live in a service layer. |
+| **API** | `app/api/v1/endpoints/` | HTTP routing, request validation via `app/schemas/`, dependency injection of the DB session. Catches domain exceptions and maps them to HTTP status codes. No business rules. |
+| **Schemas** | `app/schemas/` | Pydantic DTOs. The only types that cross the API boundary — ORM objects never leave the repository/service layer. |
+| **Services** | `app/services/` | Business logic and transaction boundary. `RentalService` owns the `start_rental` / `return_rental` flow: SELECT FOR UPDATE car lock, status validation, idempotent return, `db.commit()`, post-commit event publish. |
+| **Repositories** | `app/repositories/` | Thin data access. `db.add` / `db.flush` / `db.query`. No commits, no business validation. Car and User repositories also expose CRUD helpers used directly by their endpoints (single-table, no orchestration). |
 | **Models** | `app/models/` | SQLAlchemy ORM definitions. UTC-aware timestamps via `TimestampMixin`. |
-| **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics. |
-| **Events** | `app/events/` | Reserved for message-broker integration. Stub publisher today, broker-aware tomorrow. |
-| **Services / Repositories** | `app/services/`, `app/repositories/` | Empty packages reserved for when business logic outgrows the CRUD layer (e.g., a third entity, multi-step workflows, or external integrations). |
+| **Events** | `app/events/` | Domain event publisher. Today: structured INFO logs on the `drivenow.events` logger. Tomorrow: drop-in AMQP/Redis backend; call sites stay identical. |
+| **Core** | `app/core/` | Cross-cutting infrastructure: settings, DB engine, logging, Prometheus metrics + `FleetCollector` gauges. |
 
 ## Quickstart
 
@@ -1545,13 +1697,12 @@ PostgreSQL.
 app/
 ├── api/
 │   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py, users.py
-├── crud/               # SQLAlchemy data access: crud_car.py, crud_rental.py, crud_user.py
+├── services/           # business logic + transactions: rental_service.py
+├── repositories/       # thin SQLAlchemy data access: car_repo.py, rental_repo.py, user_repo.py
 ├── models/             # SQLAlchemy ORM (User, Car, Rental, TimestampMixin)
 ├── schemas/            # Pydantic DTOs (car.py, rental.py, user.py)
-├── services/           # reserved — see Layers table
-├── repositories/       # reserved — see services/
-├── events/             # reserved publisher stub for future broker
-├── core/               # config, database, logging, metrics
+├── events/             # domain event publisher (drivenow.events logger)
+├── core/               # config, database, logging, metrics + FleetCollector
 └── main.py             # FastAPI app entrypoint
 alembic/                # schema migrations
   ├── 0001              # cars + rentals + carstatus enum
@@ -1559,21 +1710,43 @@ alembic/                # schema migrations
 tests/
 ├── conftest.py         # shared fixtures (engine, db_session, api_client, seed_user)
 ├── test_api/           # endpoint smoke tests
-└── test_crud/          # direct CRUD layer unit tests
+└── test_crud/          # direct repository + service unit tests
 docs/                   # additional architecture docs (placeholder)
 logs/                   # host-mounted log dir (.gitkeep tracked)
 ```
 
+## Development & Quality Assurance
+
+To ensure code quality, security, and consistent formatting, an audit script is provided:
+
+```bash
+./scripts/audit.sh
+```
+
+## Completed in Phase 4.5
+
+- **Service + Repository split.** Business logic, validation, transactions,
+  and event publishing live in `app/services/rental_service.py`
+  (`RentalService`). Repositories under `app/repositories/` are thin —
+  `db.add` / `db.flush` / `db.query` only, no commits. Endpoints depend on
+  the service, not on repository internals.
+- **Domain event publisher wired.** `publish()` in
+  `app/events/publisher.py` is no longer a no-op — it emits structured
+  INFO logs on the `drivenow.events` logger so consumers can subscribe
+  by logger name. `RentalService` calls it post-commit for
+  `rental.started` and `rental.ended` events. Swapping in a real broker
+  (RabbitMQ / Redis Streams) is a one-file change; call sites stay
+  identical.
+- **Custom Prometheus gauges.** `FleetCollector` in `app/core/metrics.py`
+  exposes `drivenow_available_cars` and `drivenow_active_rentals` as
+  scrape-time gauges, queried directly from the DB on each `/metrics`
+  poll (single source of truth, no drift).
+
 ## Out of scope (next iterations)
 
-- Custom Prometheus gauges (`drivenow_active_cars`,
-  `drivenow_ongoing_rentals`) so the dashboard answers "how many cars
-  are out right now?" without scraping the full operation histogram.
 - DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
-- Real message broker — `app/events/publisher.py` is still a no-op.
-- Promote the `app/services/` layer; align the `app/crud/` vs
-  `app/repositories/` naming.
-- Real message broker — `app/events/publisher.py` is a no-op today.
+- Real message broker (RabbitMQ / Redis Streams) — publisher interface
+  is in place; only the body of `publish()` needs to change.
 - Auth, rate limiting.
 -e \n
 --- FILE: ./docker-compose.yml ---
@@ -1680,6 +1853,7 @@ Revises:
 Create Date: 2026-04-28 00:00:00.000000
 
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -1774,6 +1948,7 @@ Revises: 0001
 Create Date: 2026-04-30 00:00:00.000000
 
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -1809,10 +1984,13 @@ def upgrade() -> None:
     # Restructure rentals: drop customer_name, rename date columns,
     # make end_time nullable, add user_id FK.
     op.drop_column("rentals", "customer_name")
-    op.alter_column("rentals", "start_date", new_column_name="start_time",
-                    server_default=sa.func.now())
-    op.alter_column("rentals", "end_date", new_column_name="end_time",
-                    nullable=True)
+    op.alter_column(
+        "rentals",
+        "start_date",
+        new_column_name="start_time",
+        server_default=sa.func.now(),
+    )
+    op.alter_column("rentals", "end_date", new_column_name="end_time", nullable=True)
     op.add_column(
         "rentals",
         sa.Column(
@@ -1833,10 +2011,10 @@ def downgrade() -> None:
     # Backfill before tightening the constraint, otherwise populated tables
     # blow up on the ALTER.
     op.execute("UPDATE rentals SET end_time = now() WHERE end_time IS NULL")
-    op.alter_column("rentals", "end_time", new_column_name="end_date",
-                    nullable=False)
-    op.alter_column("rentals", "start_time", new_column_name="start_date",
-                    server_default=None)
+    op.alter_column("rentals", "end_time", new_column_name="end_date", nullable=False)
+    op.alter_column(
+        "rentals", "start_time", new_column_name="start_date", server_default=None
+    )
 
     # Same pattern for customer_name: add nullable + backfill, then NOT NULL.
     # Adding a NOT NULL column with no default to a populated table fails
