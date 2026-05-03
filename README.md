@@ -166,8 +166,9 @@ curl -s -X POST http://localhost:8000/api/v1/rentals/ \
 
 The car's status flips to `IN_USE` atomically. Renting a car that is not
 `AVAILABLE` returns `400 {"detail": "Car 1 is not available (status=IN_USE)"}`.
-The CRUD layer takes a `SELECT … FOR UPDATE` row lock on the car so concurrent
-booking attempts of the same car serialize at the DB.
+The service layer takes a `SELECT … FOR UPDATE` row lock on the car so concurrent
+booking attempts of the same car serialize at the DB. Return requests acquire
+a lock on the rental row first, making the already-returned guard race-free.
 
 ### Return a rental
 

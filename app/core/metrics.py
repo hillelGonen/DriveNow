@@ -144,7 +144,7 @@ class FleetCollector:
                 value=available_count,
             )
 
-            active_rentals = db.query(Rental).filter(Rental.end_time == None).count()
+            active_rentals = db.query(Rental).filter(Rental.end_time.is_(None)).count()
             yield GaugeMetricFamily(
                 "drivenow_active_rentals",
                 "Current count of ongoing rentals",
