@@ -402,12 +402,5 @@ Our system follows a strict contract and ensures data consistency across service
 | Component | Description | Screenshot |
 | :--- | :--- | :--- |
 | **Interactive Docs** | Fully typed Swagger/OpenAPI documentation. | ![Swagger](docs/screenshots/swagger_ui.png) |
-| **Event Stream** | Redis Streams capturing real-time rental events. | ![Redis](docs/screenshots/redis_events.png) |
-
-![Full System Demo](docs/screenshots/system_demo.png)
-
-
-## Out of scope (next iterations)
-
-- DB-level overlap prevention via `tstzrange` + `EXCLUDE USING gist`.
-- Auth, rate limiting.
+| **Event Stream** | Redis Streams capturing real-time rental events. | ![Redis](docs/screenshots/redis_events.png)|
+| **Full System Demo** | Actual Behavior using the CLI | ![Full System Demo](docs/screenshots/system_demo.png) |
