@@ -9,6 +9,7 @@ that the endpoint layer depends only on the service contract.
 
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.car import Car
@@ -93,6 +94,30 @@ def get(db: Session, rental_id: int) -> Rental | None:
         with the given ``rental_id`` exists.
     """
     return db.get(Rental, rental_id)
+
+
+def list_rentals(
+    db: Session,
+    active_only: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[Rental]:
+    """List rentals ordered by id descending (most recent first).
+
+    Args:
+        db: The active SQLAlchemy database session.
+        active_only: If ``True``, return only rentals with ``end_time IS NULL``.
+        limit: Maximum number of rows to return.
+        offset: Rows to skip from the start of the result set.
+
+    Returns:
+        A list of ``Rental`` ORM instances.
+    """
+    stmt = select(Rental).order_by(Rental.id.desc())
+    if active_only:
+        stmt = stmt.where(Rental.end_time.is_(None))
+    stmt = stmt.limit(limit).offset(offset)
+    return list(db.scalars(stmt))
 
 
 def stamp_end_time(rental: Rental) -> None:
