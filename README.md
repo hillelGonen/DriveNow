@@ -376,25 +376,6 @@ To ensure code quality, security, and consistent formatting, an audit script is 
 ./scripts/audit.sh
 ```
 
-## Completed in Phase 4.5
-
-- **Service + Repository split.** Business logic, validation, transactions,
-  and event publishing live in `app/services/rental_service.py`
-  (`RentalService`). Repositories under `app/repositories/` are thin —
-  `db.add` / `db.flush` / `db.query` only, no commits. Endpoints depend on
-  the service, not on repository internals.
-- **Domain event publisher wired.** `publish()` in
-  `app/events/publisher.py` is no longer a no-op — it emits structured
-  INFO logs on the `drivenow.events` logger so consumers can subscribe
-  by logger name. `RentalService` calls it post-commit for
-  `rental.started` and `rental.ended` events. Swapping in a real broker
-  (RabbitMQ / Redis Streams) is a one-file change; call sites stay
-  identical.
-- **Custom Prometheus gauges.** `FleetCollector` in `app/core/metrics.py`
-  exposes `drivenow_available_cars` and `drivenow_active_rentals` as
-  scrape-time gauges, queried directly from the DB on each `/metrics`
-  poll (single source of truth, no drift).
-
 ### API Interface & Event Streaming
 
 Our system follows a strict contract and ensures data consistency across services through events.
