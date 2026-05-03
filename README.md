@@ -3,30 +3,33 @@
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-v0.110-green.svg)
 ![Redis](https://img.shields.io/badge/Redis-Streams-red.svg)
+![Streamlit](https://img.shields.io/badge/Streamlit-Admin-ff4b4b.svg)
 
 Vehicle Management System for a Car Rental Company.
 FastAPI + PostgreSQL + SQLAlchemy, containerized with Docker Compose,
-instrumented with Prometheus.
+instrumented with Prometheus, with a Streamlit admin dashboard.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     Client([Client])
+    Admin[Streamlit Admin<br/>frontend/main.py]
     API[API Layer<br/>app/api/v1/endpoints/]
     Service[Service Layer<br/>app/services/<br/>RentalService]
     Repo[Repository Layer<br/>app/repositories/]
     DB[(PostgreSQL)]
     Events[Event Publisher<br/>app/events/]
-    MQ[[Message Queue<br/>future]]
+    Redis[[Redis Streams<br/>drivenow_events]]
     Prom[/Prometheus<br/>/metrics/]
 
     Client -->|HTTP| API
+    Admin -->|HTTP| API
     API -->|Pydantic DTO| Service
     Service -->|domain ops| Repo
     Repo -->|SQLAlchemy| DB
     Service -.->|publish events| Events
-    Events -.->|XADD| Redis[[Redis Streams<br/>drivenow_events]]
+    Events -.->|XADD| Redis
     API -. instrumentator .-> Prom
     API -. track_operation .-> Prom
 ```
@@ -52,12 +55,29 @@ docker compose up --build
 ```
 
 On boot, the `api` container runs `alembic upgrade head` and then starts uvicorn.
+The `frontend` container starts the Streamlit admin dashboard.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /health` | Liveness check |
-| `GET /metrics` | Prometheus exposition (API + service-layer histograms) |
-| `GET /docs` | OpenAPI / Swagger UI |
+| URL | Purpose |
+|-----|---------|
+| `http://localhost:8000/health` | Liveness check |
+| `http://localhost:8000/metrics` | Prometheus exposition (API + service-layer histograms) |
+| `http://localhost:8000/docs` | OpenAPI / Swagger UI |
+| `http://localhost:8502` | Streamlit admin dashboard (cars, users, rentals, metrics) |
+
+### Streamlit Admin Dashboard
+
+The `frontend` service is a Streamlit app at `http://localhost:8502` that
+provides full CRUD across cars, users and rentals plus a live metrics panel.
+It talks to the FastAPI backend via the Docker-internal URL `http://api:8000`
+(overridable with the `API_BASE_URL` env var).
+
+Tabs:
+- **Cars** — list, create, partial update (model / year / status), delete (with active-rental guard).
+- **Users** — list, create, lookup by id, delete (with active-rental guard). The list table shows each user's currently held cars by joining `/api/v1/users/` with `/api/v1/rentals/?active=true`.
+- **Rentals** — fleet table joined with the active-rental table (each row shows car state plus the renter's `user_id` and name when in use), plus forms to start a rental (AVAILABLE-only car selectbox + user selectbox) and return one by `rental_id`.
+- **Metrics** — per-operation success/error/total breakdown plus live gauges.
+
+Sidebar: live metric cards (available cars, active rentals, total successes/errors) with a manual refresh button.
 
 ## API usage
 
@@ -170,6 +190,18 @@ The service layer takes a `SELECT … FOR UPDATE` row lock on the car so concurr
 booking attempts of the same car serialize at the DB. Return requests acquire
 a lock on the rental row first, making the already-returned guard race-free.
 
+### List rentals
+
+```bash
+curl -s "http://localhost:8000/api/v1/rentals/?active=true"
+curl -s "http://localhost:8000/api/v1/rentals/?limit=50&offset=0"
+```
+
+`active=true` filters to rentals with `end_time IS NULL` (currently in progress).
+Results are ordered by `id` descending (most recent first). `limit` is capped
+at 500. The Streamlit dashboard uses this endpoint to join cars with their
+active renter.
+
 ### Return a rental
 
 ```bash
@@ -254,13 +286,15 @@ docker compose exec api alembic downgrade -1
 docker compose exec api pytest tests/ -v
 ```
 
-Three tests today:
+25 tests across API and CRUD layers:
 
-| File | Test | What it proves |
-|---|---|---|
-| [tests/test_api/test_cars.py](tests/test_api/test_cars.py) | `test_create_and_list_car` | POST creates a car (default `AVAILABLE`), GET lists it, status filter works. |
-| [tests/test_api/test_rentals.py](tests/test_api/test_rentals.py) | `test_double_rental_returns_400` | First booking succeeds and flips the car to `IN_USE`; the second returns 400. |
-| [tests/test_api/test_rentals.py](tests/test_api/test_rentals.py) | `test_return_rental_sets_end_time_and_frees_car` | Return sets `end_time`, flips the car back to `AVAILABLE`; second return is rejected. |
+- `tests/test_api/` — endpoint smoke tests (cars, users, rentals, delete guards).
+- `tests/test_crud/` — direct repository + service unit tests.
+
+Highlights:
+- `test_double_rental_returns_400` — second booking of an `IN_USE` car is rejected.
+- `test_return_rental_sets_end_time_and_frees_car` — return stamps `end_time`, flips car to `AVAILABLE`, second return is rejected.
+- `test_delete_*_with_active_rental_returns_409` — entity delete guards.
 
 Shared fixtures live in [tests/test_api/conftest.py](tests/test_api/conftest.py): a per-test in-memory SQLite engine with `StaticPool`, a `db_session`, an `api_client` that overrides FastAPI's `get_db`, and a `seed_user` fixture so the rental tests run zero-touch (no manual psql).
 
@@ -312,13 +346,14 @@ PostgreSQL.
 app/
 ├── api/
 │   └── v1/endpoints/   # FastAPI routers: cars.py, rentals.py, users.py
-├── services/           # business logic + transactions: rental_service.py
+├── services/           # business logic + transactions: rental_service.py, exceptions.py
 ├── repositories/       # thin SQLAlchemy data access: car_repo.py, rental_repo.py, user_repo.py
 ├── models/             # SQLAlchemy ORM (User, Car, Rental, TimestampMixin)
 ├── schemas/            # Pydantic DTOs (car.py, rental.py, user.py)
-├── events/             # domain event publisher (drivenow.events logger)
+├── events/             # Redis Streams publisher + drivenow.events logger
 ├── core/               # config, database, logging, metrics + FleetCollector
 └── main.py             # FastAPI app entrypoint
+frontend/               # Streamlit admin dashboard (main.py, Dockerfile, requirements.txt)
 alembic/                # schema migrations
   ├── 0001              # cars + rentals + carstatus enum
   └── 0002              # rental engine (users, user_id FK, time columns)
