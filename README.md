@@ -79,6 +79,9 @@ Tabs:
 
 Sidebar: live metric cards (available cars, active rentals, total successes/errors) with a manual refresh button.
 
+<img width="1908" height="975" alt="image" src="https://github.com/user-attachments/assets/12954123-c976-44ba-8acf-0c081a26477f" />
+
+
 ## API usage
 
 ### Create a car
