@@ -1,3 +1,11 @@
+"""HTTP endpoints for the Car resource.
+
+CRUD over ``/api/v1/cars``. All handlers are thin: validation lives in
+the Pydantic schemas, persistence in ``car_repo``. Each handler is wrapped
+with ``@track_operation`` so its duration and outcome appear in
+``drivenow_service_operation_*`` Prometheus metrics.
+"""
+
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -16,6 +24,16 @@ logger = logging.getLogger(__name__)
 @router.post("", response_model=CarRead, status_code=status.HTTP_201_CREATED)
 @track_operation("car.create")
 def create_car(payload: CarCreate, db: Session = Depends(get_db)) -> CarRead:
+    """Create a new car in the fleet.
+
+    Args:
+        payload: Validated request body containing model, year, and
+            optional initial status.
+        db: Injected database session (FastAPI dependency).
+
+    Returns:
+        The newly created car as a ``CarRead`` DTO. HTTP 201.
+    """
     car = car_repo.create(db, payload)
     logger.info("car.created id=%s model=%s year=%s", car.id, car.model, car.year)
     return CarRead.model_validate(car)
@@ -29,6 +47,18 @@ def list_cars(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[CarRead]:
+    """List cars in the fleet with optional filter and pagination.
+
+    Args:
+        status_filter: Optional ``status`` query parameter to restrict by
+            ``CarStatus``. Aliased from ``status`` in the URL.
+        limit: Maximum number of rows to return (1–200, default 50).
+        offset: Number of rows to skip (>= 0, default 0).
+        db: Injected database session (FastAPI dependency).
+
+    Returns:
+        A list of ``CarRead`` DTOs ordered by ``id`` ascending.
+    """
     cars = car_repo.list_cars(db, status=status_filter, limit=limit, offset=offset)
     return [CarRead.model_validate(c) for c in cars]
 
@@ -38,6 +68,21 @@ def list_cars(
 def update_car(
     car_id: int, payload: CarUpdate, db: Session = Depends(get_db)
 ) -> CarRead:
+    """Apply a partial update to an existing car.
+
+    Only fields explicitly provided in ``payload`` are modified.
+
+    Args:
+        car_id: Path parameter identifying the car to update.
+        payload: Validated request body with the fields to change.
+        db: Injected database session (FastAPI dependency).
+
+    Returns:
+        The updated car as a ``CarRead`` DTO.
+
+    Raises:
+        HTTPException: 404 if no car exists with the given ``car_id``.
+    """
     car = car_repo.get(db, car_id)
     if car is None:
         logger.warning("car.update.not_found id=%s", car_id)
@@ -56,6 +101,22 @@ def update_car(
 @router.delete("/{car_id}", status_code=status.HTTP_204_NO_CONTENT)
 @track_operation("car.delete")
 def delete_car(car_id: int, db: Session = Depends(get_db)) -> Response:
+    """Delete a car from the fleet.
+
+    Refuses if the car has any active rental (``end_time`` is ``NULL``)
+    to prevent orphaning an in-progress rental record.
+
+    Args:
+        car_id: Path parameter identifying the car to delete.
+        db: Injected database session (FastAPI dependency).
+
+    Returns:
+        An empty 204 response on successful deletion.
+
+    Raises:
+        HTTPException: 404 if no car exists with the given ``car_id``.
+        HTTPException: 409 if the car has at least one active rental.
+    """
     car = car_repo.get(db, car_id)
     if car is None:
         logger.warning("car.delete.not_found id=%s", car_id)

@@ -1,3 +1,14 @@
+"""Logging configuration for the DriveNow application.
+
+Sets up the root logger with two handlers on every call to ``setup_logging``:
+- A ``StreamHandler`` writing to stdout (consumed by Docker and log aggregators).
+- A ``RotatingFileHandler`` writing to ``Settings.LOG_FILE``
+  (10 MB per file, 5 rotating backups).
+
+All timestamps are rendered in UTC via a custom ``time.gmtime`` converter,
+regardless of the host system timezone.
+"""
+
 import logging
 import os
 import sys
@@ -10,7 +21,13 @@ _DATE_FORMAT = "%Y-%m-%dT%H:%M:%S%z"  # ISO 8601 with timezone
 
 
 def setup_logging() -> None:
-    """Configure root logger with console + rotating file handlers. Idempotent."""
+    """Configure the root logger with console and rotating file handlers.
+
+    Clears any existing handlers before attaching new ones, making this
+    function safe to call multiple times (idempotent). Also suppresses
+    ``uvicorn.access`` and ``sqlalchemy.engine`` to ``WARNING`` so they
+    do not pollute application logs at ``INFO`` level.
+    """
     settings = get_settings()
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
 
@@ -42,6 +59,17 @@ def setup_logging() -> None:
 
 
 def _gmt_converter(*args):
+    """Convert a log record timestamp to UTC.
+
+    Assigned to ``logging.Formatter.converter`` so that all ``%(asctime)s``
+    fields are rendered in UTC regardless of the host system timezone.
+
+    Args:
+        *args: Raw timestamp arguments forwarded from the logging framework.
+
+    Returns:
+        A ``time.struct_time`` representing the given time in UTC.
+    """
     import time
 
     return time.gmtime(*args)
