@@ -1,3 +1,16 @@
+"""Prometheus instrumentation for the DriveNow service layer.
+
+Provides two complementary instrumentation mechanisms:
+
+1. ``track_operation(name)`` — a decorator that records the duration and
+   outcome (``success`` / ``error``) of any sync or async callable as
+   labelled Histogram and Counter metrics.
+
+2. ``FleetCollector`` — a custom Prometheus collector that queries the
+   database at every ``/metrics`` scrape to expose live fleet gauges
+   (``drivenow_available_cars``, ``drivenow_active_rentals``).
+"""
+
 import inspect
 import time
 from functools import wraps
@@ -21,10 +34,32 @@ SERVICE_OPERATION_TOTAL = Counter(
 
 
 def track_operation(name: str):
-    """Decorator for service methods. Records duration + outcome.
+    """Decorator that records duration and outcome of a service operation.
 
-    Works on both sync and async callables — detects coroutine functions
-    so service-layer code can use one decorator regardless of style.
+    Wraps the decorated callable in a try/finally block that observes
+    elapsed time and increments ``drivenow_service_operation_duration_seconds``
+    and ``drivenow_service_operation_total`` with labels ``operation=name``
+    and ``status=success|error``. Exceptions are re-raised after recording.
+
+    Works transparently on both sync and async callables — coroutine
+    functions are detected via ``inspect.iscoroutinefunction`` so endpoints
+    and services can use a single decorator style regardless of async/sync.
+
+    Args:
+        name: The operation label written to Prometheus (e.g. ``"car.create"``
+            or ``"rental.start"``). Should be a stable dotted string — changing
+            it breaks dashboards and alerts.
+
+    Returns:
+        A decorator that wraps the target callable with metrics recording.
+
+    Example:
+        .. code-block:: python
+
+            @router.post("/cars")
+            @track_operation("car.create")
+            def create_car(payload: CarCreate, db: Session = Depends(get_db)):
+                ...
     """
 
     def decorator(fn):
@@ -68,16 +103,38 @@ def track_operation(name: str):
 
 
 class FleetCollector:
+    """Custom Prometheus collector for live fleet and rental gauges.
+
+    Registered with the global ``REGISTRY`` at application startup.
+    Prometheus scrapes ``/metrics`` and calls ``collect()`` on every
+    registered collector, so the gauge values always reflect the current
+    database state at scrape time — no caching, no drift.
+
+    Metrics exposed:
+        drivenow_available_cars: Number of cars whose status is ``AVAILABLE``.
+        drivenow_active_rentals: Number of rentals with no ``end_time``
+            (i.e. currently ongoing).
+    """
+
     def collect(self):
-        # Preventing Circular import
+        """Query the database and yield current fleet gauge values.
+
+        Opens a short-lived session for each scrape, queries the car and
+        rental tables, then closes the session in a ``finally`` block.
+        Imports are deferred inside the method to avoid circular imports
+        at module load time.
+
+        Yields:
+            ``GaugeMetricFamily`` instances for ``drivenow_available_cars``
+            and ``drivenow_active_rentals``.
+        """
+        # Deferred to avoid circular import: metrics ← database ← config
         from app.core.database import SessionLocal
         from app.models.car import Car, CarStatus
         from app.models.rental import Rental
 
-        # Open local session for every scan
         db = SessionLocal()
         try:
-            # metrics 1: available cars
             available_count = (
                 db.query(Car).filter(Car.status == CarStatus.AVAILABLE).count()
             )
@@ -87,7 +144,6 @@ class FleetCollector:
                 value=available_count,
             )
 
-            # metrics 2: Active Rentals
             active_rentals = db.query(Rental).filter(Rental.end_time == None).count()
             yield GaugeMetricFamily(
                 "drivenow_active_rentals",
