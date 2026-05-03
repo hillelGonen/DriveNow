@@ -5,9 +5,13 @@ variable of the same name. The settings instance is process-scoped and
 cached via ``@lru_cache`` so the file and environment are read only once.
 """
 
+import logging
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_VALID_LOG_LEVELS = frozenset(logging.getLevelNamesMapping())
 
 
 class Settings(BaseSettings):
@@ -21,8 +25,8 @@ class Settings(BaseSettings):
             OpenAPI title.
         DATABASE_URL: SQLAlchemy-compatible connection string for the
             PostgreSQL database.
-        LOG_LEVEL: Minimum log level for the root logger
-            (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``, ``CRITICAL``).
+        LOG_LEVEL: Minimum log level for the root logger. Must be one of
+            ``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``, or ``CRITICAL``.
         LOG_FILE: Absolute path to the rotating log file written by the
             application. The directory is created automatically if absent.
         REDIS_URL: Connection URL for the Redis instance used by the event
@@ -41,6 +45,28 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "/app/logs/app.log"
     REDIS_URL: str = "redis://redis:6379/0"
+
+    @field_validator("LOG_LEVEL")
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Reject invalid log level names at startup rather than silently falling back.
+
+        Args:
+            v: The raw ``LOG_LEVEL`` string from the environment.
+
+        Returns:
+            The uppercased level name if valid.
+
+        Raises:
+            ValueError: If ``v`` is not a recognised Python logging level name.
+        """
+        upper = v.upper()
+        if upper not in _VALID_LOG_LEVELS:
+            raise ValueError(
+                f"Invalid LOG_LEVEL '{v}'. Must be one of: "
+                f"{', '.join(sorted(_VALID_LOG_LEVELS))}"
+            )
+        return upper
 
 
 @lru_cache

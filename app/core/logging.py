@@ -12,6 +12,7 @@ regardless of the host system timezone.
 import logging
 import os
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 
 from app.core.config import get_settings
@@ -58,7 +59,7 @@ def setup_logging() -> None:
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 
-def _gmt_converter(*args):
+def _gmt_converter(*args) -> time.struct_time:
     """Convert a log record timestamp to UTC.
 
     Assigned to ``logging.Formatter.converter`` so that all ``%(asctime)s``
@@ -70,6 +71,4 @@ def _gmt_converter(*args):
     Returns:
         A ``time.struct_time`` representing the given time in UTC.
     """
-    import time
-
     return time.gmtime(*args)

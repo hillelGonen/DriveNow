@@ -14,9 +14,10 @@ from sqlalchemy.orm import Session
 from app.models.car import CarStatus
 from app.models.user import User
 from app.repositories import car_repo
-from app.repositories.rental_repo import (
+from app.services.exceptions import (
     CarNotAvailableError,
     RentalAlreadyReturnedError,
+    RentalNotFoundError,
 )
 from app.schemas.car import CarCreate
 from app.schemas.rental import RentalCreate

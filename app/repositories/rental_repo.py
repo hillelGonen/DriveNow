@@ -2,6 +2,9 @@
 
 Repository layer: focused strictly on database operations. No business
 logic, no transaction management (caller commits), no event publishing.
+
+Domain exceptions live in ``app.services.exceptions`` — not here — so
+that the endpoint layer depends only on the service contract.
 """
 
 from datetime import datetime, timezone
@@ -11,18 +14,6 @@ from sqlalchemy.orm import Session
 from app.models.car import Car
 from app.models.rental import Rental
 from app.schemas.rental import RentalCreate
-
-
-class CarNotAvailableError(Exception):
-    """Raised when a rental cannot start because the car is not AVAILABLE."""
-
-
-class RentalNotFoundError(Exception):
-    """Raised when a rental id does not exist."""
-
-
-class RentalAlreadyReturnedError(Exception):
-    """Raised when return_car is called on a rental whose end_time is set."""
 
 
 def lock_car(db: Session, car_id: int) -> Car | None:
@@ -43,6 +34,26 @@ def lock_car(db: Session, car_id: int) -> Car | None:
         given ``car_id`` exists.
     """
     return db.query(Car).filter(Car.id == car_id).with_for_update().one_or_none()
+
+
+def lock_rental(db: Session, rental_id: int) -> Rental | None:
+    """Acquire a row-level lock on a rental record.
+
+    Issues a ``SELECT ... FOR UPDATE`` query on the rental row, preventing
+    concurrent return requests from both passing the ``end_time is None``
+    guard and double-stamping the return time. The caller is responsible
+    for committing or rolling back the enclosing transaction to release
+    the lock.
+
+    Args:
+        db: The active SQLAlchemy database session.
+        rental_id: The primary key of the rental to lock.
+
+    Returns:
+        The locked ``Rental`` ORM instance, or ``None`` if no rental with
+        the given ``rental_id`` exists.
+    """
+    return db.query(Rental).filter(Rental.id == rental_id).with_for_update().one_or_none()
 
 
 def insert_rental(db: Session, data: RentalCreate) -> Rental:
@@ -68,7 +79,10 @@ def insert_rental(db: Session, data: RentalCreate) -> Rental:
 
 
 def get(db: Session, rental_id: int) -> Rental | None:
-    """Fetch a single rental by primary key.
+    """Fetch a single rental by primary key without locking.
+
+    Use ``lock_rental`` instead when the caller needs to guard a
+    concurrent write (e.g. ``return_rental``).
 
     Args:
         db: The active SQLAlchemy database session.

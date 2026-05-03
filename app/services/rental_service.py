@@ -13,12 +13,12 @@ from app.events.publisher import publish
 from app.models.car import CarStatus
 from app.models.rental import Rental
 from app.repositories import rental_repo
-from app.repositories.rental_repo import (
+from app.schemas.rental import RentalCreate
+from app.services.exceptions import (
     CarNotAvailableError,
     RentalAlreadyReturnedError,
     RentalNotFoundError,
 )
-from app.schemas.rental import RentalCreate
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +29,16 @@ class RentalService:
     Orchestrates the full start and return flows, enforcing business rules,
     managing the transaction boundary, and publishing domain events post-commit.
 
-    The car-row SELECT FOR UPDATE serializes concurrent bookings of the same
-    car at the database level, making the AVAILABLE status check race-free.
+    Both ``start_rental`` and ``return_rental`` acquire ``SELECT FOR UPDATE``
+    row locks before any status check, making all operations race-free under
+    concurrent requests.
 
     Sequence (start):
         lock car → validate AVAILABLE → insert rental →
         flip car to IN_USE → commit → publish ``rental.started``.
 
     Sequence (return):
-        load rental → guard already-returned → lock car →
+        lock rental → validate not-already-returned → lock car →
         stamp end_time → flip car to AVAILABLE → commit → publish ``rental.ended``.
 
     Attributes:
@@ -107,11 +108,11 @@ class RentalService:
     def return_rental(self, rental_id: int) -> Rental:
         """Process the return of an active rental.
 
-        Loads the rental and enforces idempotency — a rental whose
-        ``end_time`` is already set is rejected immediately. Then acquires a
-        row-level lock on the associated car, stamps the ``end_time`` with the
-        current UTC time, and flips the car back to ``AVAILABLE``. Commits the
-        transaction and publishes a ``rental.ended`` domain event post-commit.
+        Acquires a row-level lock on the rental row first, making the
+        ``end_time is None`` guard race-free under concurrent return requests.
+        Then locks the car row, stamps ``end_time``, and flips the car back
+        to ``AVAILABLE``. Commits the transaction and publishes a
+        ``rental.ended`` domain event post-commit.
 
         Args:
             rental_id: The primary key of the ``Rental`` record to return.
@@ -128,7 +129,9 @@ class RentalService:
                 already set, indicating it was previously returned. Prevents
                 silent mutation of ``end_time`` on repeated calls.
         """
-        rental = rental_repo.get(self.db, rental_id)
+        # Lock the rental row first so concurrent return requests serialise
+        # here and only one proceeds past the end_time guard.
+        rental = rental_repo.lock_rental(self.db, rental_id)
         if rental is None:
             raise RentalNotFoundError(f"Rental {rental_id} not found")
         if rental.end_time is not None:
@@ -141,6 +144,13 @@ class RentalService:
         rental_repo.stamp_end_time(rental)
         if car is not None:
             car.status = CarStatus.AVAILABLE
+        else:
+            logger.warning(
+                "return_rental: car %s not found while returning rental %s "
+                "— car may have been deleted while rental was active",
+                rental.car_id,
+                rental_id,
+            )
 
         self.db.commit()
         self.db.refresh(rental)

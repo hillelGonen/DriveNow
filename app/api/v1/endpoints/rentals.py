@@ -13,12 +13,12 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.metrics import track_operation
-from app.repositories.rental_repo import (
+from app.schemas.rental import RentalCreate, RentalResponse
+from app.services.exceptions import (
     CarNotAvailableError,
     RentalAlreadyReturnedError,
     RentalNotFoundError,
 )
-from app.schemas.rental import RentalCreate, RentalResponse
 from app.services.rental_service import RentalService
 
 router = APIRouter(prefix="/rentals", tags=["rentals"])
@@ -70,10 +70,11 @@ def start_rental(
 def return_rental(rental_id: int, db: Session = Depends(get_db)) -> RentalResponse:
     """Mark a rental as returned and free the associated car.
 
-    Delegates to ``RentalService.return_rental``: stamps ``end_time``,
-    flips the car back to ``AVAILABLE``, commits, and publishes the
-    ``rental.ended`` event. A second return on the same rental is
-    rejected idempotently with HTTP 400.
+    Delegates to ``RentalService.return_rental``: locks the rental row,
+    stamps ``end_time``, flips the car back to ``AVAILABLE``, commits,
+    and publishes the ``rental.ended`` event. Concurrent return attempts
+    on the same rental serialise at the database lock. A second return
+    after the first commits is rejected with HTTP 400.
 
     Args:
         rental_id: Path parameter identifying the rental to return.
