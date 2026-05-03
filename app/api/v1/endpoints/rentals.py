@@ -8,11 +8,12 @@ and serialise the result through ``RentalResponse``.
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.metrics import track_operation
+from app.repositories import rental_repo
 from app.schemas.rental import RentalCreate, RentalResponse
 from app.services.exceptions import (
     CarNotAvailableError,
@@ -23,6 +24,31 @@ from app.services.rental_service import RentalService
 
 router = APIRouter(prefix="/rentals", tags=["rentals"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/", response_model=list[RentalResponse])
+@track_operation("rental.list")
+def list_rentals(
+    active: bool = Query(default=False),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[RentalResponse]:
+    """List rentals, most recent first.
+
+    Args:
+        active: If ``True``, return only rentals whose ``end_time`` is ``NULL``.
+        limit: Maximum number of rows to return (1–500, default 200).
+        offset: Number of rows to skip (>= 0, default 0).
+        db: Injected database session (FastAPI dependency).
+
+    Returns:
+        A list of ``RentalResponse`` DTOs ordered by id descending.
+    """
+    rentals = rental_repo.list_rentals(
+        db, active_only=active, limit=limit, offset=offset
+    )
+    return [RentalResponse.model_validate(r) for r in rentals]
 
 
 @router.post("/", response_model=RentalResponse, status_code=status.HTTP_201_CREATED)
